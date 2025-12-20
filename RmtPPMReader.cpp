@@ -17,7 +17,7 @@ void RmtPPMReader::begin(uint8_t pin, uint32_t rmtFreqHz, uint16_t pulses, uint1
   // RMT init (RX mode assumed constant)
   if (!rmtInit(gpio, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_1, /*Hz*/ 1000000)) {
     Serial.println("init receiver failed");
-    while (true) delay(10);
+    while (true) vTaskDelay(10);
   }
 
   // Set sync gap max threshold (empirically: 2100 us is safe for FlySky-style PPM)
@@ -27,7 +27,7 @@ void RmtPPMReader::begin(uint8_t pin, uint32_t rmtFreqHz, uint16_t pulses, uint1
   if (xTaskCreate(readTask, "RmtPPMReader", 4096, this, 4, NULL) != pdPASS) {
     Serial.println("Failed to create RmtPPMReader readTask");
   }
-  delay(100); // Give time to sync with radio;
+  vTaskDelay(200); // Give time to sync with radio;
 }
 
 void RmtPPMReader::readTask(void *args) {
@@ -38,7 +38,7 @@ void RmtPPMReader::readTask(void *args) {
   esp_log_level_set("*", ESP_LOG_NONE); // suppress noisy prints if needed
   #endif
 
-  while (1) {
+  while (true) {
     // Scrape RMT HW buffer. rx_num_symbols is both input (desired) and output (actual).
     checker = rmtRead(me->gpio, me->rx_symbols, &me->rx_num_symbols, /*timeout ms*/ 30);
 
