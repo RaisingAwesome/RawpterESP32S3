@@ -180,7 +180,7 @@ struct AltitudeData
   uint8_t i2cAddress = 0x46;      // 0x46 is the Pressure Sensor 0x42 is the GPS
   volatile float altitude = 0.0f; // just a default until it starts to loop.
   float highestAltitude = 0.0f;
-  const float ceiling = 12.0f;
+  float ceiling = 12.0f;
   volatile float rateFPS = 0.0f;         // Used to ensure it doesn't descend too quickly
   volatile float rateFPSWorking = 0.0f;  // This one is worked by the pressure task and then synced to rateFPS variable in the main loop.
   volatile float altitudeWorking = 0.0f; // This one is worked by the pressure task and then synced to altitude variable in the main loop.
@@ -707,10 +707,10 @@ inline void controlMixer()
   float throttle_corrected = throttle_desired * thrust_compensation;
 
   // Quad mixing
-  m1_command_scaled = throttle_corrected - pitch_PID + roll_PID + yaw_PID; // Front left
-  m2_command_scaled = throttle_corrected - pitch_PID - roll_PID - yaw_PID; // Front right
-  m3_command_scaled = throttle_corrected + pitch_PID - roll_PID + yaw_PID; // Back right
-  m4_command_scaled = throttle_corrected + pitch_PID + roll_PID - yaw_PID; // Back left
+  m1_command_scaled = throttle_corrected - pitch_PID + roll_PID - yaw_PID; // Front left
+  m2_command_scaled = throttle_corrected - pitch_PID - roll_PID + yaw_PID; // Front right
+  m3_command_scaled = throttle_corrected + pitch_PID - roll_PID - yaw_PID; // Back right
+  m4_command_scaled = throttle_corrected + pitch_PID + roll_PID + yaw_PID; // Back left
 
   // ---Normalize if any motor > 1.0 --- This is assuming scaling down has the same thrust dynamics.
   float max_val = fmaxf(fmaxf(m1_command_scaled, m2_command_scaled),
@@ -1376,7 +1376,7 @@ void PIDControlCalcs()
   static float prevRateErrorPitch = 0.0f;
   float p = GyroX; // roll rate 
   float q = GyroY; // pitch rate (nose up positive) - pitch is already minused to correct physical orientation to NASA rules
-  float r = GyroZ; // yaw rate (nose right positive) - yaw is already minused to correct physical orientation to NASA rules
+  float r = GyroZ; 
   
   if (PWM_throttle < 1520) // Reset the control if on the ground. This prevents integral windup and sudden jumps on takeoff.
   {
@@ -2319,7 +2319,7 @@ void saveParameters()
 {
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
   prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
-  prefs.putFloat("ceiling", altitudeData.ceiling;
+  prefs.putFloat("ceiling", altitudeData.ceiling);
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("trimPitch", trimPitch);
