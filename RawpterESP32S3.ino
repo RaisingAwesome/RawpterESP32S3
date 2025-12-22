@@ -135,7 +135,7 @@ static const int upDownPin = stickRightVertical;  // elevation (pitch)
 static const int ruddPin = stickLeftHorizontal;   // rudder (yaw)
 static const int throttleCutSwitchPin = SwitchA;  // throttle cut
 static const int failsafePin = SwitchB;           // Receiver failsafed - force a landing
-static int16_t failsafeThrottlePWM = 1700;        // A safe throttle for descent.
+static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
 static int16_t highestThrottlePWM = 1500;
 static int16_t lowestThrottlePWM = 2000;
 static float trimYaw = 0;
@@ -189,9 +189,9 @@ struct AltitudeData
   float ki_altitude_rate = .0001f;
   volatile float invGroundPressure = 0.0f;        // reciprocal of baseline pressure at startup
   volatile float invGroundPressureWorking = 0.0f; // This one is worked by the pressure task and then synced to invGroundPressure variable in the main loop.
-  TaskHandle_t bmpTaskHandle;                     // Handle for the BMP581 task that will run on its own core.
+  TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
 };
-AltitudeData altitudeData;
+AltitudeData altitudeData{};
 // General stuff for controlling timing of things
 static float deltaTime = 0.0f;
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -206,8 +206,8 @@ TaskHandle_t loopDroneHandle; // Handle for the main drone control loop task tha
 // Radio communication:
 static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_Failsafed;
 static int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
-static float maxRoll = 30.0f;  // Max roll angle in degrees for angle mode
-static float maxPitch = 30.0f; // Max pitch angle in degrees for angle mode
+static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
+static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
 static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
 
 // IMU:
@@ -249,11 +249,11 @@ static int m1_command_PWM, m2_command_PWM, m3_command_PWM, m4_command_PWM;
 
 // Voltage Monitoring and Beeping
 static unsigned long buzzer_millis;
-
 static int batteryVoltage = 777;             // just a default for the battery monitoring routine
 static unsigned long next_voltage_check = 0; // used in loopBuzzer to check for voltage on the main battery.
 static bool beeping = false;                 // For tracking beeping when the battery is getting low.
 static float calced_voltage = 14.8;
+TaskHandle_t buzzerTaskHandle;
 
 // WiFi Variables
 static WiFiServer server(80);
@@ -298,7 +298,7 @@ void setup()
   setupSerial();             // Sets up both Serial and Serial1 for communication.
   setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
   setupMotorCommunication(); // Sets up ledc channels for motor controol
-  setupBatteryMonitor();     // Setup pin for reading the Battery
+  beginBuzzerTask();     // Setup pin for reading the Battery
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
   Wire.begin(8, 9);
@@ -316,11 +316,11 @@ void setup()
     waitForRadio();
   Serial.println("Ready...");
   beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
-  beginDroneLoopTask();
+  beginDroneLoopTask(); // The inner loop. It runs at 2K on Core 1 by itself. The rest runs on Core 0.
 }
 
 void loop()
-{ // Not used since we are running tasks
+{ // Not used since we are running tasks, but must remain for the Arduino IDE.
 }
 
 void tick()
@@ -336,14 +336,13 @@ void loopDrone(void *pvParameters)
   while (true)
   {
     tick();
-    syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task.
-    getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call.
-    getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 2kHz. IMU output. is actually downsampled from 32kHz.
+    syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict.
+    getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering.
+    getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 2kHz. IMU output. Is actually downsampled from 32kHz.
     getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness.
     PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle
     motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle.
     tock();                                   // Yields until the end of the 500uS pacing is met to sustain 2kHz
-    loopBuzzer();                             // A method to play tones as needed to "communicate" with the pilot.
     troubleShooting();
   }
 }
@@ -353,7 +352,7 @@ void loopDrone(void *pvParameters)
 // ========================================================================================================================//
 void syncAltitude()
 { // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
-  // the bmpTask use the variables "xWorking". Once it notifies that the calculations are complete, we consume them.
+  // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
   {
     altitudeData.altitude = altitudeData.altitudeWorking;
@@ -415,7 +414,7 @@ inline void setAltitudeRate()
   int m = filled ? N : M;
   if (m < 2)
   {
-    altitudeData.rateFPS = 0.0f;
+    altitudeData.rateFPSWorking = 0.0f;
     return;
   }
 
@@ -471,7 +470,7 @@ void setAltitude()
   const float exponent = 0.190284f;   // barometric exponent
   const float scaleFeet = 145366.45f; // conversion to feet
   bmp5_sensor_data data = {0, 0};
-  unsigned long mytime;
+
   int8_t err = altitudeData.pressureSensor.getSensorData(&data);
   if (err == BMP5_OK)
   {
@@ -483,8 +482,10 @@ void setAltitude()
 
     // Ratio of current pressure to baseline
     float ratio = data.pressure * altitudeData.invGroundPressureWorking;
+    ratio = fmaxf(ratio, 0.000001f);
     // Compute relative altitude in feet
-    altitudeData.altitudeWorking = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
+    float newAltitude = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
+    altitudeData.altitudeWorking = 0.6f * altitudeData.altitudeWorking + 0.4f * newAltitude;
   }
   else
   {
@@ -503,6 +504,20 @@ void beginWifiTask()
     NULL,                        // Parameters
     1,                           // Priority (lower than PID loop)
     &wifiTaskHandle, // Task handle
+    0                            // Core 0 since it is slower overall
+  );
+}
+
+void beginBuzzerTask()
+{
+  // Start task that handles communication with the buzzer.
+  xTaskCreatePinnedToCore(
+    buzzerTask,        // Task function
+    "Buzzer Task",               // Name
+    4096,                        // Stack size (bytes)
+    NULL,                        // Parameters
+    1,                           // Priority (lower than PID loop)
+    &buzzerTaskHandle,            // Task handle
     0                            // Core 0 since it is slower overall
   );
 }
@@ -780,10 +795,9 @@ void waitForRadio()
     PWM_throttle_prev = getRadioPWM(throttlePin, 2000);              // keep it stuck in the loop if it failsafes
     PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 1520); // keep it stuck in the loop if it failsafes
     tick();
-    loopBuzzer(); // A method to play tones as needed to "communicate" with the pilot.
     getIMUdata();
     tock(); // This will warm up the Madgwick while we wait for them to turn on the radio.
-    delay(10);
+    vTaskDelay(1);
   }
 
   // Seed the rest of the controls' prev(ious) values.
@@ -869,7 +883,23 @@ void playReadySong()
     delay(400);
   }
 }
+void playNope()
+{
+  // Melody (first bar of Danger Zone, simplified)
+  int melody[] = {Note_FS4, Note_FS4};
 
+  // Durations (ms) — quarter = 400ms, half = 800ms
+  int noteDurations[] = {50, 50};
+
+  for (int i = 0; i < 2; i++)
+  {
+    int duration = noteDurations[i];
+    ledcWriteTone(BUZZER_PIN, melody[i] / 3);
+    delay(duration * .8); // add pause between notes
+    ledcWriteTone(BUZZER_PIN, 0);
+    delay(duration * .8);
+  }
+}
 inline void loopBuzzer()
 { // this monitors the battery.  the lower it gets, the faster it beeps.
   // disabling for now until we get the wiring correct in the next version
@@ -1443,10 +1473,12 @@ inline void getRadioStickValues()
   PWM_yaw = getRadioPWM(ruddPin, 1500);
   PWM_ThrottleCutSwitch = getRadioPWM(SwitchA, 2000);
   PWM_Failsafed = getRadioPWM(SwitchB, 2000);
-
+  if (altitudeData.altitude>altitudeData.ceiling) ceilingOverride = true;
+  
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
-  if (PWM_Failsafed > 1500)
+  if (PWM_Failsafed > 1500||ceilingOverride)
   {
+    if (PWM_Failsafed > 1500) ceilingOverride = false; // If you hit the ceiling, it will descend, but you can cancel it out after under the ceiling by flipping the landing switch.
     if (altitudeData.altitude < 0.5f)
     {
       killMotors();
@@ -1469,6 +1501,7 @@ inline void getRadioStickValues()
         PWM_throttle = constrain(PWM_throttle,1500,2000);
         if (PWM_throttle<=1500) killMotors();
       }
+      else PWM_throttle=PWM_throttle_prev;
     }
   }
   else
@@ -1608,17 +1641,25 @@ void throttleCut()
       // reset (uncut throttle) only if throttle is down to prevent a jolting suprise
       if (PWM_throttle < 1520 && ++throttleNotCutCounter > 10)
       { // The radio is ready for flight and confirmed not to be just a blip.
-        throttle_is_cut = false;
-        throttleNotCutCounter = 0;
-        throttleCutCounter = 0;
-        flying = false;
-        xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
-        lowestThrottlePWM = 2000;
-        highestThrottlePWM = 1500;
-        altitudeData.highestAltitude = 0.0f;
-        playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
-        MadgwickInit();     // Reset the quarterion based on sitting still.
-        resetTimers = true; // This will reset all counters to sync timing on the next tock();
+        if (PWM_Failsafed > 1500)
+        {
+          playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
+          throttleNotCutCounter = 0;
+        }
+        else
+        {
+          throttle_is_cut = false;
+          throttleNotCutCounter = 0;
+          throttleCutCounter = 0;
+          flying = false;
+          xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
+          lowestThrottlePWM = 2000;
+          highestThrottlePWM = 1500;
+          altitudeData.highestAltitude = 0.0f;
+          playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
+          MadgwickInit();     // Reset the quarterion based on sitting still.
+          resetTimers = true; // This will reset all counters to sync timing on the next tock();
+        }
       }
     }
     return;
@@ -1636,13 +1677,13 @@ void throttleCut()
   }
 
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
-  if (roll_IMU > 70 || roll_IMU < -70 || pitch_IMU > 70 || pitch_IMU < -70)
+  if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
   {
     killMotors();
     return;
   }
 
-  if (!flying || altitudeData.altitude < 2) // this is tip over protection at take-off or if it is having a hard landing.
+  if (!flying || altitudeData.altitude < 2) // this is tip over protection at take-off
   {
     if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
     {
@@ -1654,11 +1695,6 @@ void throttleCut()
 
   throttleNotCutCounter = 0;
   throttleCutCounter = 0;
-}
-
-String tuningProcedure()
-{
-  return "<hr><h3><b>Ziegler-Nichols</b></h3>  <p>The Ziegler-Nichols tuning method is one of the most famous ways to experimentally tune a PID controller. The basic algorithm is as follows:</p><ol><li>Turn off the Integral and Derivative components for the controller; only use Proportional control.</li><li>Slowly increase the gain (i.e. <em>K<sub>p</sub></em>, the Proportion constant) until the process starts to oscillate<br />This final gain value is known as the ultimate gain, or <em>K<sub>u</sub></em><br />The period of oscillation is the ultimate period, or <em>T<sub>u</sub></em></li><li>Use the following table to derive the PID variables</li></ol></div></div><div class=\"sqs-block code-block sqs-block-code\" data-block-type=\"23\" id=\"block-yui_3_17_2_1_1598301478634_207710\"><div class=\"sqs-block-content\"><style type=\"text/css\">.tg  {border-collapse:collapse;border-spacing:0;}.tg td{border-color:black;border-style:solid;border-width:1px;  overflow:hidden;padding:10px 5px;word-break:normal;}.tg th{border-color:black;border-style:solid;border-width:1px;  font-weight:normal;overflow:hidden;padding:10px 5px;word-break:normal;}.tg .tg-gr1d{background-color:#e9f4fc;border-color:#337494;font-weight:bold;text-align:left;vertical-align:top}.tg .tg-m4ds{border-color:#337494;text-align:center;vertical-align:top}.tg .tg-bxxa{border-color:#337494;text-align:left;vertical-align:top}.tg .tg-hk19{background-color:#e9f4fc;border-color:#337494;font-weight:bold;text-align:center;vertical-align:top}.tg .tg-vaq8{background-color:#e9f4fc;border-color:#337494;text-align:left;vertical-align:top}.tg .tg-e1cu{background-color:#e9f4fc;border-color:#337494;text-align:center;vertical-align:top}</style><table class=\"table\"><thead>  <tr>    <th class=\"tg-gr1d\">Controller</th>    <th class=\"tg-hk19\">K<sub>p</sub></th>    <th class=\"tg-hk19\">T<sub>i</sub></th>    <th class=\"tg-hk19\">T<sub>d</sub></th>  </tr></thead><tbody>  <tr>    <td class=\"tg-bxxa\">P</td>    <td class=\"tg-m4ds\">K<sub>u</sub>/2</td>    <td class=\"tg-m4ds\"></td>    <td class=\"tg-m4ds\"></td>  </tr>  <tr>    <td class=\"tg-vaq8\">PI</td>    <td class=\"tg-e1cu\">K<sub>u</sub>/2.5</td>    <td class=\"tg-e1cu\">T<sub>u</sub>/1.25</td>    <td class=\"tg-e1cu\"></td>  </tr>  <tr>    <td class=\"tg-bxxa\">PID</td>    <td class=\"tg-m4ds\">0.6K<sub>u</sub></td>    <td class=\"tg-m4ds\">T<sub>u</sub>/2</td>    <td class=\"tg-m4ds\">T<sub>u</sub>/8</td>  </tr>  <tr>    <td class=\"tg-vaq8\">Pessen Integral Rule<br></td>    <td class=\"tg-e1cu\">0.7K<sub>u</sub></td>    <td class=\"tg-e1cu\">0.4T<sub>u</sub></td>    <td class=\"tg-e1cu\">0.15T<sub>u</sub></td>  </tr>  <tr>    <td class=\"tg-bxxa\">Moderate overshoot</td>    <td class=\"tg-m4ds\">K<sub>u</sub>/3</td>    <td class=\"tg-m4ds\">T<sub>u</sub>/2</td>    <td class=\"tg-m4ds\">T<sub>u</sub>/3</td>  </tr>  <tr>    <td class=\"tg-vaq8\">No overshoot</td>    <td class=\"tg-e1cu\">K<sub>u</sub>/5</td>    <td class=\"tg-e1cu\">T<sub>u</sub>/2</td>    <tdclass=\"tg-e1cu\">T<sub>u</sub>/3</td>  </tr></tbody></table>";
 }
 
 void killMotors()
@@ -1838,6 +1874,9 @@ void printJSON()
     Serial.print(PWM_yaw);
     Serial.print(F(", \"PWM_ThrottleCutSwitch\": "));
     Serial.print(PWM_ThrottleCutSwitch);
+    Serial.print(F(", \"PWM_Failsafed\": "));
+    Serial.print(PWM_Failsafed);
+    
     Serial.print(F(", \"Throttle_is_Cut\": "));
     Serial.print(throttle_is_cut);
 
@@ -1980,7 +2019,17 @@ void wifiTask(void *pvParameters)
     vTaskDelay(250);
   }
 }
-
+void buzzerTask(void *pvParameters)
+{
+  setupBatteryMonitor();
+  vTaskDelay(100);
+  while (true)
+  {
+    // Do the sensor read
+    if (throttle_is_cut) loopBuzzer();
+    vTaskDelay(500);
+  }
+}
 void setupWiFi()
 {
   const char *ssid = "_Rawpter";
@@ -2012,9 +2061,9 @@ void loopWiFi()
   WiFiClient client = server.available();
 
   int waitCount = 0;
-  while (!client.available() && waitCount < 3000) { // wait up to 3 s
+  while (!client.available()) { // wait up to 3 s
       vTaskDelay(1);
-      waitCount++;
+      if (++waitCount>3000) break;
   }
 
   if (!client.available()) {
@@ -2080,18 +2129,16 @@ void loopWiFi()
   // --- Your form submission ---
   else if (req.startsWith("GET /?"))
   {
-    Serial.println("About to set values...");
     setValuesFromUserForm(req);
-    Serial.println("Values set, sending redirect page...");
 
     const char *body =
         "<!DOCTYPE html>"
         "<html><head>"
         "<meta http-equiv='refresh' content='0.2;url=http://192.168.2.4/'>"
-        "<title>Redirecting...</title>"
+        "<title>Redirecting</title>"
         "</head>"
         "<body>"
-        "<h1>Settings saved. Redirecting...</h1>"
+        "<div style='font-size:60pt;'>Settings saved. Refreshing...</div>"
         "</body></html>";
 
     int len = strlen(body);
@@ -2199,6 +2246,7 @@ void setValuesFromUserForm(String req)
       failsafeThrottlePWM = value.toInt();
     else if (key == "kp_altitude_rate") altitudeData.kp_altitude_rate = value.toFloat();
     else if (key == "ki_altitude_rate") altitudeData.ki_altitude_rate = value.toFloat();
+    else if (key == "ceiling") altitudeData.ceiling = value.toFloat();
     else if (key == "trimPitch")
       trimPitch = value.toFloat();
     else if (key == "trimYaw")
@@ -2207,10 +2255,10 @@ void setValuesFromUserForm(String req)
       trimRoll = value.toFloat();
     else if (key == "action")
     {
-      if (value == "SAVE TO STORAGE")
-        saveParameters();
+      if (value.indexOf("SAVE TO") != -1) {
+          saveParameters();
+      }
     }
-    Serial.println("Key: " + key);
   }
 }
 
@@ -2270,14 +2318,13 @@ void writeRegister(uint8_t reg, uint8_t value)
 void saveParameters()
 {
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
-  //prefs.clear(); Deletes all
-  prefs.putInt("failsafeThrottlePWM", failsafeThrottlePWM);
-  prefs.putFloat("kp_altitude_rate", altitudeData.kp_altitude_rate);
-  prefs.putFloat("ki_altitude_rate", altitudeData.ki_altitude_rate);
+  prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
+  prefs.putFloat("ceiling", altitudeData.ceiling;
+  prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
+  prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("trimPitch", trimPitch);
   prefs.putFloat("trimRoll", trimRoll);
   prefs.putFloat("trimYaw", trimYaw);
-  
   prefs.putFloat("stick_dampener", stick_dampener);
   prefs.putFloat("i_limit", i_limit);
   prefs.putFloat("i_limit_rate", i_limit_rate);
@@ -2299,9 +2346,8 @@ void saveParameters()
   prefs.putFloat("Kp_yaw_rate", Kp_yaw_rate);
   prefs.putFloat("Ki_yaw_rate", Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", Kd_yaw_rate);
-
   prefs.end(); // close namespace
-  Serial.println("Parameters saved to NVS.");
+  Serial.println("Free entries: " + String(prefs.freeEntries()));
 }
 
 void loadParameters()
@@ -2309,9 +2355,10 @@ void loadParameters()
   prefs.begin("rawpter", true); // namespace "rawpter", read-only
 
   // Use current variable values as defaults
-  failsafeThrottlePWM = prefs.getInt("failsafeThrottlePWM", failsafeThrottlePWM);
-  altitudeData.kp_altitude_rate = prefs.getFloat("kp_altitude_rate", altitudeData.kp_altitude_rate);
-  altitudeData.ki_altitude_rate = prefs.getFloat("ki_altitude_rate", altitudeData.ki_altitude_rate);
+  failsafeThrottlePWM = prefs.getInt("fsThrottlePWM", failsafeThrottlePWM);
+  altitudeData.kp_altitude_rate = prefs.getFloat("kpaltrate", altitudeData.kp_altitude_rate);
+  altitudeData.ki_altitude_rate = prefs.getFloat("kialtrate", altitudeData.ki_altitude_rate);
+  altitudeData.ceiling = prefs.getFloat("ceiling", altitudeData.ceiling);
   trimPitch = prefs.getFloat("trimPitch", trimPitch);
   trimRoll = prefs.getFloat("trimRoll", trimRoll);
   trimYaw = prefs.getFloat("trimYaw", trimYaw);
@@ -2367,7 +2414,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "input[type=text], input[type=number] {";
   body += "font-size:20px; padding:8px; width:180px; box-sizing:border-box;";
   body += "border:1px solid #ccc; border-radius:6px; margin-top:6px; }";
-  body += "</style></head><body>"; 
+  body += "</style></head><body><div id='myHider'>"; 
   body += "<form method=get><div class='container'>";
   // Header and snapshot
   body += "<h1 class='alert alert-success mb-0 pt-0'>Rawpter V8"; 
@@ -2415,12 +2462,13 @@ void GenerateDefaultPage(WiFiClient &client)
   String(B_madgwick) + "'></td></tr>";
   body += "</table><br>";
   body += "<table class=table><thead class=thead-dark><th></th><th>Max Rate</th></thead>";
-  body += "<tr><td>Roll:</td><td><input name=roll_maxRate style='width:80px;' step=.1 type=number value='" + String(rollLimits.maxRate) + "'></td></tr>";
+  body += "<tr><td>Roll:</td><td><input name=roll_maxRate style='width:90px;' type=number value='" + String(rollLimits.maxRate) + "'></td></tr>";
   // Pitch row
-  body += "<tr><td>Pitch:</td><td><input name=pitch_maxRate style='width:80px;' step=.1 type=number value='" + String(pitchLimits.maxRate) + "'></td></tr>";
+  body += "<tr><td>Pitch:</td><td><input name=pitch_maxRate style='width:90px;' type=number value='" + String(pitchLimits.maxRate) + "'></td></tr>";
   body += "</table><br>Tip: Before powering down, Save to Storage - but don't bother otherwise to extend the flash life.<br>";
   // Additional parameters table 
   body += "<table>";
+  body += "<tr><td>Ceiling:</td><td><input type=number name=ceiling style='width:80px;' step = .1 value='" + String(altitudeData.ceiling,1) + "'></td></tr>";
   body += "<tr><td>Failsafe Throttle (1500 to 2000):</td><td><input type=number name=failsafeThrottlePWM style='width:80px;' value='" + String(failsafeThrottlePWM) + "'></td></tr>";
   body += "<tr><td>Kp Altitude Rate:</td><td><input type=number name=kp_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.kp_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Ki Altitude Rate:</td><td><input type=number name=ki_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.ki_altitude_rate,5) + "'></td></tr>";
@@ -2432,13 +2480,26 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Gyro Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Gyro_filter style='width:80px;' value='" + String(Gyro_filter) + "'></td></tr>";
   body += "</table>";
   // Buttons 
-  body += "<br><input style='margin-top:8px; padding:6px 12px; background-color:#0d6efd; color:#fff; border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' type='submit' name='action' value='SUBMIT' />"; body += "<br><br><br><input style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#fff; border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' type='submit' name='action' value='SAVE TO STORAGE' />";
-  body += "</div></form>";
-  // Tuning procedure and tip2067
-  body += tuningProcedure(); 
-  body += "Tip: Copilot says that 'P' should be the biggest, then D. 'I' can be half of 'D'.  Kp=30, Ki=12, Kd=20 is a blind starting point.";
-  // Close HTML
-  body += "</body></html>";
+  body += "<br><input "
+        "style='margin-top:8px; padding:6px 12px; background-color:#0d6efd; color:#fff; " 
+        "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' " 
+        "type='submit' name='action' value='SUBMIT' " 
+        "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";  
+
+  body += "<br><br><br><input "
+        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#fff; "
+        "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
+        "type='submit' name='action' value='SAVE TO STORAGE' "
+        "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";
+  
+  body += "</div></div>"
+    "<div style='display:none' id='shower'>"
+    "<br><br><br>"
+      "<div style='font-size:30pt; display:block; margin: 0 auto;'>"
+        "Saving..."
+      "</div>"
+    "</div></form></body></html>";
+
   // Build headers now that we know the exact body length 
   String headers;
   headers.reserve(128); 
