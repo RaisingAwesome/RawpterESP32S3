@@ -3,7 +3,7 @@ Rawpter is a custom flight controller for a quadcopter. It is based on the ESP32
 
 # Hardware
 - Microcontroller: ESP32-S3-Mini-1U
-- IMU: ICM 40906 (6 axis accelerometer and gyro, SPI)
+- IMU: ICM 40609 (6 axis accelerometer and gyro, SPI)
 - Altitude: BMP581 pressure sensor (I2C)
 - GPS: Ublox Max-10S (I2C)
 - PCB: Custom Design
