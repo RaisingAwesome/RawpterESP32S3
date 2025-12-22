@@ -701,7 +701,7 @@ inline void controlMixer()
 
   // Compute thrust compensation factor
   float thrust_compensation = 1.0f / cos(tilt_angle_rad);
-  thrust_compensation = constrain(thrust_compensation, 1.0f, 1.3f); // Prevent runaway
+  thrust_compensation = constrain(thrust_compensation, 1.0f, 1.15f); // Prevent runaway
 
   // Apply to throttle
   float throttle_corrected = throttle_desired * thrust_compensation;
