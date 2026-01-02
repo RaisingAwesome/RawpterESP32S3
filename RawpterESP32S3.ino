@@ -2,17 +2,15 @@
 // Flight Controller code for ESP32-S3
 // Go to https:// raisingawesome.site/projects for more info
 // MIT License - use at your own risk
-
-#include <SPI.h>  // SPI Communication Support for IMU
-#include <WiFi.h> // ESP32 Adhoc WiFi Support
+#include "DataTypes.h"
+#include <SPI.h>                             // SPI Communication Support for IMU
+#include <WiFi.h>                            // ESP32 Adhoc WiFi Support
 #include <WebServer.h>
 #include <Wire.h>                            // I2C Communication for GPS and Pressure Sensor
-#include <SparkFun_BMP581_Arduino_Library.h> // BMP581 Pressure Sensor
-#include <SparkFun_u-blox_GNSS_v3.h>         // Max10S GPS
 #include <functional>
-#include "driver/gpio.h"   // speeds up digitalWrite
-#include "driver/rmt_rx.h" // for PPM pulse capture
-#include "RmtPPMReader.h"
+#include "driver/gpio.h"                     // ESP32-S3 routines to speed up digitalWrite
+#include "driver/rmt_rx.h"                   // ESP32-S3 routines for remote PPM pulse capture
+#include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
 
 // ========================================================================================================================//
 //                                               USER-SPECIFIED VARIABLES                                                 //
@@ -27,40 +25,18 @@
 #define MOTOR_FREQ_HZ 400.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point.
 #define RAMP_DURATION_SEC 0.35f      // how long in seconds to take a command a motor to go from 1000 PWM to 2000 PWM. The ConditionCommands() is the routine that ramps it. Keeps it from body slamming itself on a spike.
 #define ALT_FREQ_HZ 100.0f           // Check altitude just 100 times per second.
-
-#define ESC_FREQ_HZ 400
-#define ESC_RESOLUTION 14
+#define ESC_FREQ_HZ 400              // How frequent to send commands to the ESC
+#define ESC_RESOLUTION 14            // Bits to use for PWM pulses
 #define ESC_PERIOD_US 2500
-#define ESC_MAX_DUTY 16383
-// counts per µs (precompute)
-#define ESC_US_TO_DUTY 6.5536f
+#define ESC_MAX_DUTY 16383           // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty.
+#define ESC_US_TO_DUTY 6.5536f       // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty.
 
 // Parameter Storage
 #include <Preferences.h>
 Preferences prefs;
 
-// The battery alarm code handles 14.8 or 7.4V LIPOs.  Set to your type of battery. If not hooked up, it will pull down and beep often.
-#define BATTERYTYPE 14.8
-#define BUZZER_PIN 47         // Pin 27, GPIO47
-#define BATTERY_PIN 26        // GPIO26, Pin 26 - not actually an analog input, so this needs reassigned in the next build. Using it for an output now.
-#define DEG_TO_RAD 0.0174533f // π / 180
-
-// IMU
-#define IMU_INT_PIN 7 // GPIO7 (pin 11 on ESP32-S3 MINI)
-#define ACCEL_DATA_X1 0x1F
-#define GYRO_DATA_X1 0x25
-
-// SPI setup
-#define SPI_SCLK 12
-#define SPI_MISO 13
-#define SPI_MOSI 11
-#define SPI_CS GPIO_NUM_10 // Chip select pin for IMU SPI
-
-// GPS
-static SFE_UBLOX_GNSS myGNSS;
-
 // PID parameters (this is where you "tune it".  It's best to use the WiFi interface to do it live and then update once its tuned.):
-static float i_limit = 0.5f;      // Integrator saturation level
+static float i_limit_angle = 0.5f;      // Integrator saturation level
 static float i_limit_rate = 4.0f; // Integrator saturation level
 
 static float Kp_roll_angle = 3.0f;   // Roll P-gain
@@ -77,14 +53,9 @@ static float Kp_pitch_rate = 0.0015f; // Pitch P-gain
 static float Ki_pitch_rate = 0.003f; // Pitch I-gain
 static float Kd_pitch_rate = 0.0f;   // Pitch D-gain
 
-static float Kp_yaw_rate = 0.003f; // Yaw P-gain default 30
-static float Ki_yaw_rate = 0.0001f; // Yaw I-gain default 5
+static float Kp_yaw_rate = 0.0015f; // Yaw P-gain default 30
+static float Ki_yaw_rate = 0.003f; // Yaw I-gain default 5
 static float Kd_yaw_rate = 0.0f;    // Yaw D-gain default .015 (be careful when increasing too high, motors will begin to overheat!)
-
-struct Limits
-{                // Rate Limits - need to expand this to bring in the K constants and desired setpoints
-  float maxRate; // deg/s
-};
 
 // Instantiate per-axis limits (conservative values for 10" props)
 Limits rollLimits = {160.0f}; // maxRate, maxAccel, maxJerk
@@ -102,10 +73,13 @@ static int16_t PWM_yaw_fs = 1500;               // rudd
 static int16_t PWM_ThrottleCutSwitch_fs = 2000; // SWA less than 1300, cut throttle, but we don't want to cut throttle, just allow it to decrease so it lands. - must config a switch to Channel 5 in your remote.
 static int16_t PWM_FailSafed_fs = 2000;         // Used to flag that the receiver had to go to failsafe
 static float stick_dampener = 1.0f;             // 0.1-1 Lower=slower, higher=noiser default 0.7
+static float throttleLimit = 0.6f;              // can be overridden with web interface.
 static bool failsafed = false;
 static bool failsafeTriggered = false;
 static unsigned long failsafeTime = 0;
 static bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
+static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
+static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
 
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.06f;
@@ -169,29 +143,9 @@ static const int m4Pin = 4; // IO4
 
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
-// GPS
-static bool hasGPS = false;
-
-// Pressure
-// Create a new sensor object
-struct AltitudeData
-{
-  BMP581 pressureSensor;
-  uint8_t i2cAddress = 0x46;      // 0x46 is the Pressure Sensor 0x42 is the GPS
-  volatile float altitude = 0.0f; // just a default until it starts to loop.
-  float highestAltitude = 0.0f;
-  float ceiling = 12.0f;
-  volatile float rateFPS = 0.0f;         // Used to ensure it doesn't descend too quickly
-  volatile float rateFPSWorking = 0.0f;  // This one is worked by the pressure task and then synced to rateFPS variable in the main loop.
-  volatile float altitudeWorking = 0.0f; // This one is worked by the pressure task and then synced to altitude variable in the main loop.
-  float maxAltitudeChangeRate = .8f;
-  float kp_altitude_rate = .0001f;
-  float ki_altitude_rate = .0001f;
-  volatile float invGroundPressure = 0.0f;        // reciprocal of baseline pressure at startup
-  volatile float invGroundPressureWorking = 0.0f; // This one is worked by the pressure task and then synced to invGroundPressure variable in the main loop.
-  TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
-};
+GPSData gps{};
 AltitudeData altitudeData{};
+
 // General stuff for controlling timing of things
 static float deltaTime = 0.0f;
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -206,9 +160,6 @@ TaskHandle_t loopDroneHandle; // Handle for the main drone control loop task tha
 // Radio communication:
 static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_Failsafed;
 static int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
-static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
-static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
-static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
 
 // IMU:
 static float AccX, AccY, AccZ;
@@ -220,8 +171,10 @@ static float roll_IMU_prev, pitch_IMU_prev;
 constexpr float G_PER_LSB = 1.0f / 1024.0f; // ±32 g
 constexpr float DPS_PER_LSB = 1.0f / 16.4f; // ±2000 dps
 constexpr float USEC_TO_SEC = 1.0f / 1000000.0f;
+static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
+static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
+static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
 
-// IMU calibration parameters - calibrate IMU using calculateIMUEerror() in the void setup() to get these values, then comment out calculateIMUError()
 static float AccErrorX = 0.01;
 static float AccErrorY = -0.03;
 static float AccErrorZ = 0.01;
@@ -260,34 +213,6 @@ static WiFiServer server(80);
 TaskHandle_t wifiTaskHandle;
 // WiFi End
 
-// Song notes
-// Octave 4
-#define Note_C4 262
-#define Note_CS4 277
-#define Note_D4 294
-#define Note_DS4 311
-#define Note_E4 330
-#define Note_F4 349
-#define Note_FS4 370
-#define Note_G4 392
-#define Note_GS4 415
-#define Note_A4 440
-#define Note_AS4 466
-#define Note_B4 494
-
-#define Note_C5 523
-#define Note_CS5 554
-#define Note_D5 587
-#define Note_DS5 622
-#define Note_E5 659
-#define Note_F5 698
-#define Note_FS5 740
-#define Note_G5 784
-#define Note_GS5 831
-#define Note_A5 880
-#define Note_AS5 932
-#define Note_B5 988
-
 //========================================================================================================================//
 // BEGIN THE CLASSIC SETUP AND LOOP
 //========================================================================================================================//
@@ -297,8 +222,8 @@ void setup()
   // Bootup operations
   setupSerial();             // Sets up both Serial and Serial1 for communication.
   setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
-  setupMotorCommunication(); // Sets up ledc channels for motor controol
-  beginBuzzerTask();     // Setup pin for reading the Battery
+  setupMotorCommunication(); // Sets up ledc channels for motor control
+  beginBuzzerTask();        // Setup pin for reading the Battery
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
   Wire.begin(8, 9);
@@ -315,7 +240,7 @@ void setup()
   if (!EASYCHAIR)
     waitForRadio();
   Serial.println("Ready...");
-  beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
+  if (altitudeData.hasBMP581) beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
   beginDroneLoopTask(); // The inner loop. It runs at 2K on Core 1 by itself. The rest runs on Core 0.
 }
 
@@ -353,6 +278,7 @@ void loopDrone(void *pvParameters)
 void syncAltitude()
 { // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
   // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
+  if (!altitudeData.hasBMP581) return;
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
   {
     altitudeData.altitude = altitudeData.altitudeWorking;
@@ -445,6 +371,7 @@ void bmpTask(void *pvParameters)
 
 inline void getAltitude()
 {
+  if (!altitudeData.hasBMP581) return;
   static int flyingCounter = 0;
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
     altitudeData.invGroundPressureWorking = 0.0f; // Reset ground pressure if notified to do so.
@@ -587,6 +514,7 @@ void setupPressureSensor()
   {
     Serial.println("BMP581 Filter configuration applied successfully.");
   }
+  altitudeData.hasBMP581 = false; //Not using for now
 }
 
 void halt()
@@ -598,24 +526,19 @@ void halt()
 void setupGPS()
 {
   delay(100); // give time for Wire to settle.
-  if (!myGNSS.begin(Wire))
+  if (!gps.Max10SGPS.begin(Wire))
   {
     Serial.println("u-blox GNSS not detected over I2C. Check wiring and power.");
-    hasGPS = false;
+    gps.hasGPS = false;
     return;
   }
-  hasGPS = true;
+  gps.hasGPS = true;
   Serial.println("U-Blox GPS discovered.");
 
   // Configure output protocol and update rate
-  myGNSS.setI2COutput(COM_TYPE_UBX); // UBX binary only
-  myGNSS.setNavigationFrequency(1);  // 1 Hz navigation solution
-  myGNSS.setAutoPVT(true);           // Auto PVT messages
-
-  if (myGNSS.getFixType() < 3)
-  {
-    Serial.println("Waiting for 3D fix...");
-  }
+  gps.Max10SGPS.setI2COutput(COM_TYPE_UBX); // UBX binary only
+  gps.Max10SGPS.setNavigationFrequency(1);  // 1 Hz navigation solution
+  gps.Max10SGPS.setAutoPVT(true);           // Auto PVT messages
 
   // UBX-CFG-TP5: enable TIMEPULSE at 1 Hz, 50% duty, aligned to GNSS time
   uint8_t ubxTP5[] = {
@@ -643,7 +566,7 @@ void setupGPS()
   ubxTP5[sizeof(ubxTP5) - 1] = ckB;
 
   // Send raw UBX message
-  myGNSS.pushRawData(ubxTP5, sizeof(ubxTP5));
+  gps.Max10SGPS.pushRawData(ubxTP5, sizeof(ubxTP5));
 
   Serial.println("UBX-CFG-TP5 sent: TIMEPULSE enabled at 1 Hz.");
 }
@@ -664,16 +587,16 @@ void printGPS()
   if (tick_time - print_counter > 10000)
   {
     print_counter = micros();
-    myGNSS.checkUblox(); // Process incoming data
+    gps.Max10SGPS.checkUblox(); // Process incoming data
 
-    if (myGNSS.getInvalidLlh() == false)
+    if (gps.Max10SGPS.getInvalidLlh() == false)
     {
       Serial.print("Lat: ");
-      Serial.println(myGNSS.getLatitude() / 1e7, 7);
+      Serial.println(gps.Max10SGPS.getLatitude() / 1e7, 7);
       Serial.print("Lon: ");
-      Serial.println(myGNSS.getLongitude() / 1e7, 7);
+      Serial.println(gps.Max10SGPS.getLongitude() / 1e7, 7);
       Serial.print("Alt: ");
-      Serial.println(myGNSS.getAltitude() / 1000.0, 2); // meters
+      Serial.println(gps.Max10SGPS.getAltitude() / 1000.0, 2); // meters
     }
   }
 }
@@ -707,10 +630,10 @@ inline void controlMixer()
   float throttle_corrected = throttle_desired * thrust_compensation;
 
   // Quad mixing
-  m1_command_scaled = throttle_corrected - pitch_PID + roll_PID - yaw_PID; // Front left
-  m2_command_scaled = throttle_corrected - pitch_PID - roll_PID + yaw_PID; // Front right
-  m3_command_scaled = throttle_corrected + pitch_PID - roll_PID - yaw_PID; // Back right
-  m4_command_scaled = throttle_corrected + pitch_PID + roll_PID + yaw_PID; // Back left
+  m1_command_scaled = throttle_corrected - pitch_PID + roll_PID + yaw_PID; // Front left
+  m2_command_scaled = throttle_corrected - pitch_PID - roll_PID - yaw_PID; // Front right
+  m3_command_scaled = throttle_corrected + pitch_PID - roll_PID + yaw_PID; // Back right
+  m4_command_scaled = throttle_corrected + pitch_PID + roll_PID - yaw_PID; // Back left
 
   // ---Normalize if any motor > 1.0 --- This is assuming scaling down has the same thrust dynamics.
   float max_val = fmaxf(fmaxf(m1_command_scaled, m2_command_scaled),
@@ -731,8 +654,7 @@ inline void controlMixer()
   m3_command_scaled = constrain(m3_command_scaled, 0.0f, 1.0f);
   m4_command_scaled = constrain(m4_command_scaled, 0.0f, 1.0f);
 
-  if (altitudeData.altitude < .5f)
-    ConditionCommands(); // Smooth ramping of motor speeds when launching and landing to prevent hard hits.
+  //ConditionCommands(); // Smooth ramping of motor speeds when launching and landing to prevent hard hits.
 }
 
 inline void ConditionCommands()
@@ -820,7 +742,7 @@ void setupMotorCommunication()
 
   Serial.println("Set up ledc for Motor Communication.");
 
-  calibrateESCs();
+  //calibrateESCs(); ONLY ENABLE WITHOUT PROPS!!!!!!!!!! This is written in blood!
 
   m1_command_PWM = 1000; // Will send the default for motor stopped for Simonk firmware
   m2_command_PWM = 1000;
@@ -1137,6 +1059,18 @@ inline void getIMUdata()
   lastMadgwickUpdateMicros = currentMicros;
 
   // Madgwick update
+  // The IMU’s Z‑axis physically points upward, but our control system uses the NED frame where Z points downward. 
+  // NED (North-East-Down) is standard aerospace frame.
+  // X --> forward positive
+  // Y --> right positive
+  // Z --> down positive
+  // The Rawpter is installed like this:
+  // IMU X --> Back of drone
+  // IMU Y --> Left of drone
+  // IMU Z --> Up to the sky
+  // So, to map it to the IMU's physical installation in the frame, for a Z now being roll up when compared to NED,
+  // and X pointing backwards, Y will be positive in the oppositve direction. Based on how the board is installed, 
+  // X is actually pointing to the back of the drone, so its AccX needs flipped. Thus, you call Madgwick like this:
   Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ);
 }
 
@@ -1345,7 +1279,7 @@ inline void getDesiredAnglesAndThrottleScaledToOne()
   throttle_desired = (PWM_throttle - 1500.0f) / 500.0f;   // Between  0 and 1 because anything under 1500 will be set to 1500 for now.
   roll_des = (PWM_roll - 1500.0f + trimRoll) / 500.0f;    // Between -1 and 1
   pitch_des = (PWM_pitch - 1500.0f + trimPitch) / 500.0f; // Between -1 and 1
-  yaw_des = (PWM_yaw - 1500.0f + trimYaw) / 500.0f;       // Between -1 and 1
+  yaw_des = -(PWM_yaw - 1500.0f + trimYaw) / 500.0f;       // Between -1 and 1
 
   // Constrain within normalized bounds
   throttle_desired = constrain(throttle_desired, 0.0f, 1.0f); // Between 0 and 1
@@ -1436,7 +1370,7 @@ void AngleLoopCalcs()
   // --- Roll ---
   float angleErrorRoll = roll_des - roll_IMU;
   integral_roll += angleErrorRoll * dt;
-  integral_roll = constrain(integral_roll, -i_limit, i_limit);
+  integral_roll = constrain(integral_roll, -i_limit_angle, i_limit_angle);
 
   desiredRateRoll = Kp_roll_angle * angleErrorRoll +
                     Ki_roll_angle * integral_roll;
@@ -1445,7 +1379,7 @@ void AngleLoopCalcs()
   // --- Pitch ---
   float angleErrorPitch = pitch_des - pitch_IMU;
   integral_pitch += angleErrorPitch * dt;
-  integral_pitch = constrain(integral_pitch, -i_limit, i_limit);
+  integral_pitch = constrain(integral_pitch, -i_limit_angle, i_limit_angle);
 
   desiredRatePitch = Kp_pitch_angle * angleErrorPitch +
                      Ki_pitch_angle * integral_pitch;
@@ -1463,9 +1397,7 @@ inline void getRadioStickValues()
   // Precomputed constants
   constexpr int CEILING_PERIOD = 2 * INNER_LOOP_FREQUENCY / ALT_FREQ_HZ; // Get at least 2 barameter samples before overriding by barometer
   constexpr int ASCENT_PERIOD = 2 * INNER_LOOP_FREQUENCY / ALT_FREQ_HZ;  // Get at least 2 barometer samples before overriding by barometer
-  constexpr float UP_COEFF = 0.9f;                                       // faster up
-  constexpr float DOWN_COEFF = 0.03f;                                    // slower down
-
+  
   // Read radio PWM
   PWM_throttle = getRadioPWM(throttlePin, 1000);
   PWM_roll = getRadioPWM(rollPin, 1500);
@@ -1473,51 +1405,49 @@ inline void getRadioStickValues()
   PWM_yaw = getRadioPWM(ruddPin, 1500);
   PWM_ThrottleCutSwitch = getRadioPWM(SwitchA, 2000);
   PWM_Failsafed = getRadioPWM(SwitchB, 2000);
-  if (altitudeData.altitude>altitudeData.ceiling) ceilingOverride = true;
   
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
-  if (PWM_Failsafed > 1500||ceilingOverride)
+  // Also, only allow it if in the air to prevent a ground accident.
+  if (altitudeData.hasBMP581) 
   {
-    if (PWM_Failsafed > 1500) ceilingOverride = false; // If you hit the ceiling, it will descend, but you can cancel it out after under the ceiling by flipping the landing switch.
-    if (altitudeData.altitude < 0.5f)
+    if ( PWM_Failsafed > 1500 && flying && altitudeData.altitude>5 )
     {
-      killMotors();
-    }
-    else
-    {
-      if (++throttleOverrideCounter>=INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // loop at the same frequency as the altitude checks
-      { 
-        throttleOverrideCounter = 0;
-        float rateError;
-        if (altitudeData.altitude>12.0f)
-          rateError = -0.5f - altitudeData.rateFPS; // Descent rate is faster if above 12 feet altitude
-        else if (altitudeData.altitude>6.0f)
-          rateError = -0.3f - altitudeData.rateFPS; // Descent rate is slower once between 6 and 12 feet.
-        else
-          rateError = -0.1f - altitudeData.rateFPS; // Descent rate is slower once under feet for a slow landing.
-        integralAltitudeRate += rateError*.01f;
-        integralAltitudeRate = constrain(integralAltitudeRate,-200,200);
-        PWM_throttle = failsafeThrottlePWM + altitudeData.kp_altitude_rate*rateError + altitudeData.ki_altitude_rate * integralAltitudeRate;
-        PWM_throttle = constrain(PWM_throttle,1500,2000);
-        if (PWM_throttle<=1500) killMotors();
+      if (altitudeData.altitude < 0.5f)
+      {
+        killMotors();
       }
-      else PWM_throttle=PWM_throttle_prev;
+      else
+      {
+        if (++throttleOverrideCounter>=INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // loop at the same frequency as the altitude checks
+        { 
+          throttleOverrideCounter = 0;
+          float rateError;
+          if (altitudeData.altitude>12.0f)
+            rateError = -1.0f - altitudeData.rateFPS; // Descent rate is faster if above 12 feet altitude
+          else if (altitudeData.altitude>6.0f)
+            rateError = -0.3f - altitudeData.rateFPS; // Descent rate is slower once between 6 and 12 feet.
+          else
+            rateError = -0.1f - altitudeData.rateFPS; // Descent rate is slower once under feet for a slow landing.
+          integralAltitudeRate += rateError*0.01f;
+          integralAltitudeRate = constrain(integralAltitudeRate,-400,400);
+          PWM_throttle = failsafeThrottlePWM + altitudeData.kp_altitude_rate*rateError + altitudeData.ki_altitude_rate * integralAltitudeRate;
+          PWM_throttle = constrain(PWM_throttle,1500,2000);
+          if (PWM_throttle<=1500) killMotors();
+        }
+        else PWM_throttle=PWM_throttle_prev;
+      }
     }
   }
-  else
-  {
-    if (flying)
-    {
-      if (PWM_throttle > highestThrottlePWM)
-        highestThrottlePWM = PWM_throttle;
-      else if (PWM_throttle < lowestThrottlePWM)
-        lowestThrottlePWM = PWM_throttle;
-    }
-    // Normal smoothing
-    throttleOverrideCounter = 0;
-    float coeff = (PWM_throttle > PWM_throttle_prev) ? UP_COEFF : DOWN_COEFF;
-    PWM_throttle = PWM_throttle_prev + coeff * (PWM_throttle - PWM_throttle_prev);
-  }
+
+  if (PWM_throttle > highestThrottlePWM)
+    highestThrottlePWM = PWM_throttle;
+  else if (PWM_throttle < lowestThrottlePWM)
+    lowestThrottlePWM = PWM_throttle;
+
+  // Normal smoothing
+  throttleOverrideCounter = 0;
+  float coeff = (PWM_throttle > PWM_throttle_prev) ? UP_COEFF : DOWN_COEFF;
+  PWM_throttle = PWM_throttle_prev + coeff * (PWM_throttle - PWM_throttle_prev);
   // Bottom limit
   if (PWM_throttle < 1500)
     PWM_throttle = 1500;
@@ -1536,7 +1466,13 @@ inline void getRadioStickValues()
 
 inline void setToFailsafe()
 {
-  PWM_throttle = failsafeThrottlePWM;
+  // This would only be called if the receiver itself had a major problem or is not set to failsafe
+  // in it's failsafe settings. If it loses
+  // connection, it gives its own failsafe value. To signal a failsafe state, the
+  // receiver must be setup to failsafe switchB to 2000 to flag the break of connection.
+  // With that, this would not be called. It only gets called if there is no valid value at all.
+  // That's bad news and so this routine basically drops it from the sky as it would be in a hopeless state.
+  PWM_throttle = PWM_throttle_fs;
   PWM_roll = PWM_roll_fs;
   PWM_pitch = PWM_pitch_fs;
   PWM_yaw = PWM_yaw_fs;
@@ -1590,10 +1526,10 @@ inline void scaleMotorCommandsToPWM()
    * The actual pulse width is set at the servo attach.
    */
   // Scale to Servo PWM 1000-2000 microseconds for stop to full speed.  No need to constrain since mx_command_scaled already is.
-  m1_command_PWM = m1_command_scaled * 1000 + 1000;
-  m2_command_PWM = m2_command_scaled * 1000 + 1000;
-  m3_command_PWM = m3_command_scaled * 1000 + 1000;
-  m4_command_PWM = m4_command_scaled * 1000 + 1000;
+  m1_command_PWM = throttleLimit * m1_command_scaled * 1000 + 1000;
+  m2_command_PWM = throttleLimit * m2_command_scaled * 1000 + 1000;
+  m3_command_PWM = throttleLimit * m3_command_scaled * 1000 + 1000;
+  m4_command_PWM = throttleLimit * m4_command_scaled * 1000 + 1000;
 }
 
 inline void calibrateESCs()
@@ -1601,13 +1537,14 @@ inline void calibrateESCs()
   // DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
   // If the Throttle kill switch is in the up position, then skip calibration. To calibrate, turn on the
   // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  It takes around 8 seconds.
-
+  return; //only do without props
+  /*
   uint32_t raw = radio.getChannel(4);
   Serial.print("Radio Cut PWM: ");
   Serial.println(raw);
 
-  if (getRadioPWM(throttleCutSwitchPin, 2000) > 1500)
-    return; // throttle cut switch up, then run the calibration. If off or down, skip it.
+  if (getRadioPWM(throttleCutSwitchPin, 1000) <= 1500)
+    return; // throttle cut switch down, then run the calibration. If up, skip it.
 
   Serial.println("Calibrating ESCs...");
   ESCWriteMicroseconds(m1Pin, 2000);
@@ -1621,6 +1558,8 @@ inline void calibrateESCs()
   ESCWriteMicroseconds(m4Pin, 1000);
   delay(1000);
   Serial.println("Calibration complete.");
+  while (true) delay(10); // stall out to encourage commenting this back out after calibration - written in blood approach.
+  */
 }
 
 void throttleCut()
@@ -1652,10 +1591,16 @@ void throttleCut()
           throttleNotCutCounter = 0;
           throttleCutCounter = 0;
           flying = false;
-          xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
+          if (altitudeData.hasBMP581) xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
           lowestThrottlePWM = 2000;
           highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
+          if (gps.hasGPS)
+          {
+            gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
+            gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
+            gps.fixType = gps.Max10SGPS.getFixType();
+          }
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
           MadgwickInit();     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
@@ -1672,27 +1617,37 @@ void throttleCut()
       throttle_is_cut = true;
       flying = false;
       killMotors();
+      if (gps.hasGPS)
+      {
+        gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
+        gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
+        gps.fixType = gps.Max10SGPS.getFixType();
+      }
     }
     return;
   }
 
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
-  if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
+  if (PWM_throttle<1620)
   {
-    killMotors();
-    return;
-  }
-
-  if (!flying || altitudeData.altitude < 2) // this is tip over protection at take-off
-  {
-    if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
+    if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
     {
-      // This helps with struggles on take off or it sitting too tilted on the launch pad.
       killMotors();
       return;
     }
+  } 
+  if (altitudeData.hasBMP581)
+  {
+    if (!flying || altitudeData.altitude < 2) // this is tip over protection at take-off
+    {
+      if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
+      {
+        // This helps with struggles on take off or it sitting too tilted on the launch pad.
+        killMotors();
+        return;
+      }
+    }
   }
-
   throttleNotCutCounter = 0;
   throttleCutCounter = 0;
 }
@@ -2204,8 +2159,8 @@ void setValuesFromUserForm(String req)
       stick_dampener = value.toFloat();
     else if (key == "i_limit_rate")
       i_limit_rate = value.toFloat();
-    else if (key == "i_limit")
-      i_limit = value.toFloat();
+    else if (key == "i_limit_angle")
+      i_limit_angle = value.toFloat();
     else if (key == "Accel_filter")
       Accel_filter = value.toFloat();
     else if (key == "Gyro_filter")
@@ -2238,10 +2193,22 @@ void setValuesFromUserForm(String req)
       Ki_yaw_rate = value.toFloat();
     else if (key == "kd_yaw_rate")
       Kd_yaw_rate = value.toFloat();
+    else if (key == "maxRoll")
+    {
+      maxRoll = value.toFloat();
+      maxRoll = constrain(maxRoll,5,70);
+    }
+    else if (key == "maxPitch")
+    {
+      maxPitch = value.toFloat();
+      maxPitch = constrain(maxPitch,5,70);
+    }
     else if (key == "roll_maxRate")
       rollLimits.maxRate = value.toFloat();
     else if (key == "pitch_maxRate")
       pitchLimits.maxRate = value.toFloat();
+    else if (key =="maxYaw")
+      maxYaw = value.toFloat();
     else if (key == "failsafeThrottlePWM")
       failsafeThrottlePWM = value.toInt();
     else if (key == "kp_altitude_rate") altitudeData.kp_altitude_rate = value.toFloat();
@@ -2253,6 +2220,21 @@ void setValuesFromUserForm(String req)
       trimYaw = value.toFloat();
     else if (key == "trimRoll")
       trimRoll = value.toFloat();
+    else if (key =="throttleLimit")
+    {
+      throttleLimit = value.toFloat();
+      throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
+    }
+    else if (key == "UP_COEFF")
+    {
+      UP_COEFF = value.toFloat();
+      UP_COEFF = constrain(UP_COEFF, 0.0, 1.0);
+    }
+    else if (key == "DOWN_COEFF")
+    {
+      DOWN_COEFF = value.toFloat();
+      DOWN_COEFF = constrain(DOWN_COEFF, 0.0, 1.0);
+    }
     else if (key == "action")
     {
       if (value.indexOf("SAVE TO") != -1) {
@@ -2317,16 +2299,22 @@ void writeRegister(uint8_t reg, uint8_t value)
 
 void saveParameters()
 {
+  throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
+  UP_COEFF = constrain(UP_COEFF,0.0,1.0); //protect from a fat finger
+  DOWN_COEFF = constrain(DOWN_COEFF,0.0,1.0); //protect from a fat finger
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
   prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
   prefs.putFloat("ceiling", altitudeData.ceiling);
+  prefs.putFloat("throttleLimit", throttleLimit);
+  prefs.putFloat("UP_COEFF", UP_COEFF);
+  prefs.putFloat("DOWN_COEFF", DOWN_COEFF);
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("trimPitch", trimPitch);
   prefs.putFloat("trimRoll", trimRoll);
   prefs.putFloat("trimYaw", trimYaw);
   prefs.putFloat("stick_dampener", stick_dampener);
-  prefs.putFloat("i_limit", i_limit);
+  prefs.putFloat("i_limit_angle", i_limit_angle);
   prefs.putFloat("i_limit_rate", i_limit_rate);
   prefs.putFloat("B_madgwick", B_madgwick);
   prefs.putFloat("Accel_filter", Accel_filter);
@@ -2343,11 +2331,14 @@ void saveParameters()
   prefs.putFloat("Ki_pitch_angle", Ki_pitch_angle);
   prefs.putFloat("roll_maxRate", rollLimits.maxRate);
   prefs.putFloat("pitch_maxRate", pitchLimits.maxRate);
+  prefs.putFloat("maxRoll",maxRoll);
+  prefs.putFloat("maxPitch",maxPitch);
+  prefs.putFloat("maxYaw",maxYaw);
   prefs.putFloat("Kp_yaw_rate", Kp_yaw_rate);
   prefs.putFloat("Ki_yaw_rate", Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", Kd_yaw_rate);
   prefs.end(); // close namespace
-  Serial.println("Free entries: " + String(prefs.freeEntries()));
+  //Serial.println("Free entries: " + String(prefs.freeEntries()));
 }
 
 void loadParameters()
@@ -2362,9 +2353,12 @@ void loadParameters()
   trimPitch = prefs.getFloat("trimPitch", trimPitch);
   trimRoll = prefs.getFloat("trimRoll", trimRoll);
   trimYaw = prefs.getFloat("trimYaw", trimYaw);
-  
+  throttleLimit = prefs.getFloat("throttleLimit", throttleLimit);
+  throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
+  UP_COEFF = prefs.getFloat("UP_COEFF", UP_COEFF);
+  DOWN_COEFF = prefs.getFloat("DOWN_COEFF", DOWN_COEFF);
   stick_dampener = prefs.getFloat("stick_dampener", stick_dampener);
-  i_limit = prefs.getFloat("i_limit", i_limit);
+  i_limit_angle = prefs.getFloat("i_limit_angle", i_limit_angle);
   i_limit_rate = prefs.getFloat("i_limit_rate", i_limit_rate);
   B_madgwick = prefs.getFloat("B_madgwick", B_madgwick);
   Accel_filter = prefs.getFloat("Accel_filter", Accel_filter);
@@ -2383,18 +2377,23 @@ void loadParameters()
 
   rollLimits.maxRate = prefs.getFloat("roll_maxRate", rollLimits.maxRate);
   pitchLimits.maxRate = prefs.getFloat("pitch_maxRate", pitchLimits.maxRate);
+  maxRoll = prefs.getFloat("maxRoll", maxRoll);
+  maxPitch = prefs.getFloat("maxPitch", maxPitch);
+  maxRoll = constrain(maxRoll,5,70);
+  maxPitch = constrain(maxPitch, 5, 70);
+  maxYaw = prefs.getFloat("maxYaw", maxYaw);
 
   Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", Kp_yaw_rate);
   Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", Ki_yaw_rate);
   Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", Kd_yaw_rate);
 
   prefs.end();
-  Serial.println("Parameters loaded from NVS (or defaults if none stored).");
+  //Serial.println("Parameters loaded from NVS (or defaults if none stored).");
 }
 
 void GenerateDefaultPage(WiFiClient &client) 
 { 
-  Serial.println("About to MakeWebPage.");
+  //Serial.println("About to MakeWebPage.");
   // Build HTML body first (so we can compute Content-Length)
   String body; 
   body.reserve(8192); 
@@ -2419,15 +2418,20 @@ void GenerateDefaultPage(WiFiClient &client)
   // Header and snapshot
   body += "<h1 class='alert alert-success mb-0 pt-0'>Rawpter V8"; 
   body += "<span style='font-size:10px;'> by Raising Awesome <a href='/' style='margin-top:4px; padding:3px 6px; background-color:#0d6efd; color:#fff; border:1px solid #0d6efd; border-radius:2px; width:100%; cursor:pointer; font-size:10px;'>refresh</a></span></h1><hr>";
-  body += "<b>Snapshot:</b><br>Desired Roll=" + String(roll_des) + "&#176; IMU Roll=" + String(roll_IMU) + "&#176;<br>";
-  body += "Desired Pitch=" + String(pitch_des) + "&#176; IMU Pitch=" + String(pitch_IMU) + "&#176;<br>";
-  body += "Loop Time=" + String(int(round((deltaTime) / 1000000))) + " Throttle PWM=" + String(PWM_throttle) + "<br>";
-  body += "Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")<br>";
-  body += "Highest Altitude=" + String(altitudeData.highestAltitude) + "<br>";
-  body += "Highest Throttle=" + String(highestThrottlePWM) + "<br>";
-  body += "Lowest Throttle=" + String(lowestThrottlePWM) + "<br>";
-  body += "Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")<br>";
-  body += "Altitude=" + String(altitudeData.altitude) + " ft<br><hr>";
+  body += "<b>Snapshot:</b><br>";
+  body += "<table>";
+  body += "<tr><td>Desired Roll=" + String(roll_des) + "&#176;</td><td>IMU Roll=" + String(roll_IMU) + "&#176;</td></tr>";
+  body += "<tr><td>Desired Pitch=" + String(pitch_des) + "&#176;</td><td>IMU Pitch=" + String(pitch_IMU) + "&#176;</td></tr>";
+  body += "<tr><td>Loop Time=" + String(int(round((deltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(PWM_throttle) + "</td></tr>";
+  body += "<tr><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td><td></td></tr>";
+  body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(highestThrottlePWM) + "</td></tr>";
+  body += "<tr><td>Lowest Throttle=" + String(lowestThrottlePWM) + "</td><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td></tr>";
+  body += "<tr><td>Longitude = " + String(gps.longitude,2) + "&#176;</td><td>Latitude = " + String(gps.latitude, 2) + "&#176;</td></tr>";
+  body += "<tr><td>GPS Fix=" + String(gps.fixType) +"</td><td>Altitude=" + String(altitudeData.altitude) + " ft</td></tr>";
+  body += "<tr><td>PWM Yaw=" + String(PWM_yaw) +"</td><td>PWM Row=" + String(PWM_roll) + " ft</td></tr>";
+  body += "<tr><td>PWM Pitch=" + String(PWM_pitch) +"</td></tr>";
+  body += "</table><hr>";
+  body += "<b>PID Constants:</b><br>";
   if (calced_voltage < 13) { body += "<br><div class='alert alert-danger'>DANGER: BATTERY CRITICAL!</div><br>"; } else if (calced_voltage < 14) { body += "<br><div class='alert alert-warning'>Warning: BATTERY LOW!</div><br>"; }
   // Parameters table
   body += "<table class=table><thead class=thead-dark><th></th><th>Kp</th><th>Ki</th><th>Kd</th></thead>";
@@ -2437,44 +2441,49 @@ void GenerateDefaultPage(WiFiClient &client)
   String(Ki_roll_angle, 4) + "'></td></tr>";
   body += "<tr><td>Roll Rate:</td><td><input name=kp_roll_rate style='width:80px;' type=number step=.0001 value='" +
   String(Kp_roll_rate, 4) + "'></td><td><input style='width:80px;' name=ki_roll_rate type=number step=.0001 value='" +
-  String(Ki_roll_rate, 4) + "'></td><td><input name=kd_roll_rate type=number step=.0001 style='width:80px;' value='" +
-  String(Kd_roll_rate, 4) + "'></td></tr>";
+  String(Ki_roll_rate, 4) + "'></td><td><input name=kd_roll_rate type=number step=.00001 style='width:100px;' value='" +
+  String(Kd_roll_rate, 5) + "'></td></tr>";
   // Pitch row 
   body += "<tr><td>Pitch Angle:</td><td><input name=kp_pitch_angle style='width:80px;' type=number step=.0001 value='" +
   String(Kp_pitch_angle, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_angle type=number step=.0001 value='" +
   String(Ki_pitch_angle, 4) + "'></td></tr>";
   body += "<tr><td>Pitch Rate:</td><td><input name=kp_pitch_rate style='width:80px;' type=number step=.0001 value='" +
   String(Kp_pitch_rate, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_rate type=number step=.0001 value='" +
-  String(Ki_pitch_rate, 4) + "'></td><td><input name=kd_pitch_rate type=number step=.0001 style='width:80px;' value='" +
-  String(Kd_pitch_rate, 4) + "'></td></tr>";
+  String(Ki_pitch_rate, 4) + "'></td><td><input name=kd_pitch_rate type=number step=.00001 style='width:100px;' value='" +
+  String(Kd_pitch_rate, 5) + "'></td></tr>";
   // Yaw row
   body += "<tr><td>Yaw Rate:</td><td><input name=kp_yaw_rate type=number step=0.0001 style='width:80px;' value='" +
   String(Kp_yaw_rate, 4) + "'></td><td><input style='width:80px;' type=number step=.0001 name=ki_yaw_rate value='" +
-  String(Ki_yaw_rate, 4) + "'></td><td><input type=number step=.0001 name=kd_yaw_rate style='width:80px;' value='" +
-  String(Kd_yaw_rate, 4) + "'></td></tr>";
+  String(Ki_yaw_rate, 4) + "'></td><td><input type=number step=.00001 name=kd_yaw_rate style='width:100px;' value='" +
+  String(Kd_yaw_rate, 5) + "'></td></tr>";
   // Integral limit row
-  body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit style='width:90px;' value='" +
-  String(i_limit) + "'></td></tr>"; body += "<tr><td>Rate Integral Max:</td>"
-        "<td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" +
-        String(i_limit_rate) + "'></td></tr>";
-
-  body += "<tr><td>B_Madgwick (0.06 default):</td><td><input type=number step=.0001 name=B_madgwick style='width:90px;' value='" +
+  body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit_angle style='width:90px;' value='" + String(i_limit_angle) + "'></td>";
+  body += "<td>Rate Integral Max:</td><td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" + String(i_limit_rate) + "'></td></tr>";
+  body += "<tr><td>B_Madgwick (0.03 default):</td><td><input type=number step=.0001 name=B_madgwick style='width:90px;' value='" +
   String(B_madgwick) + "'></td></tr>";
   body += "</table><br>";
-  body += "<table class=table><thead class=thead-dark><th></th><th>Max Rate</th></thead>";
-  body += "<tr><td>Roll:</td><td><input name=roll_maxRate style='width:90px;' type=number value='" + String(rollLimits.maxRate) + "'></td></tr>";
-  // Pitch row
-  body += "<tr><td>Pitch:</td><td><input name=pitch_maxRate style='width:90px;' type=number value='" + String(pitchLimits.maxRate) + "'></td></tr>";
-  body += "</table><br>Tip: Before powering down, Save to Storage - but don't bother otherwise to extend the flash life.<br>";
+  body += "<b>Rate and Angle Limits:</b><br>";
+  body += "<table class=table>";
+  body += "<thead class=thead-dark><th></th><th>Max Rate</th></thead>";
+  body += "<tr><td>Roll Rate (deg/s):</td><td><input name=roll_maxRate style='width:90px;' type=number value='" + String(rollLimits.maxRate) + "'></td>";
+  body += "<td>Roll (max angle):</td><td><input name=maxRoll style='width:90px;' type=number value='" + String(maxRoll) + "'></td></tr>";
+  body += "<tr><td>Pitch Rate (deg/s):</td><td><input name=pitch_maxRate style='width:90px;' type=number value='" + String(pitchLimits.maxRate) + "'></td>";
+  body += "<td>Pitch (max angle):</td><td><input name=maxPitch style='width:90px;' type=number value='" + String(maxPitch) + "'></td></tr>";
+  body += "<tr><td>Yaw Rate (deg/s):</td><td><input name=maxYaw style='width:90px;' type=number value='" + String(maxYaw) + "'></td></tr>";
+  body += "</table>";
+  body += "<br>Tip: Before powering down, Save to Storage - but if just experimenting during the session hold off saving to extend the Flash Storage life.<br>";
   // Additional parameters table 
   body += "<table>";
   body += "<tr><td>Ceiling:</td><td><input type=number name=ceiling style='width:80px;' step = .1 value='" + String(altitudeData.ceiling,1) + "'></td></tr>";
-  body += "<tr><td>Failsafe Throttle (1500 to 2000):</td><td><input type=number name=failsafeThrottlePWM style='width:80px;' value='" + String(failsafeThrottlePWM) + "'></td></tr>";
+  body += "<tr><td>Land Mode Start Throttle (1500 to 2000):</td><td><input type=number name=failsafeThrottlePWM style='width:80px;' value='" + String(failsafeThrottlePWM) + "'></td></tr>";
   body += "<tr><td>Kp Altitude Rate:</td><td><input type=number name=kp_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.kp_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Ki Altitude Rate:</td><td><input type=number name=ki_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.ki_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Trim - Pitch (-500 to 500):</td><td><input type=number name=trimPitch style='width:80px;' value='" + String(trimPitch) + "'></td></tr>";
   body += "<tr><td>Trim - Roll (-500 to 500):</td><td><input type=number name=trimRoll style='width:80px;' value='" + String(trimRoll) + "'></td></tr>";
   body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(trimYaw) + "'></td></tr>";
+  body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(throttleLimit, 2) + "'></td></tr>";
+  body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(UP_COEFF, 3) + "'></td></tr>";
+  body += "<tr><td>Down Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 3) + "'></td></tr>";
   body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(stick_dampener, 3) + "'></td></tr>";
   body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(Accel_filter) + "'></td></tr>";
   body += "<tr><td>Gyro Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Gyro_filter style='width:80px;' value='" + String(Gyro_filter) + "'></td></tr>";
@@ -2509,5 +2518,5 @@ void GenerateDefaultPage(WiFiClient &client)
   // Send headers + body in one go 
   client.write((const uint8_t *)headers.c_str(), headers.length());
   client.write((const uint8_t *)body.c_str(), body.length());  
-  Serial.println("Made Web Page.");
+  //Serial.println("Made Web Page.");
 }
