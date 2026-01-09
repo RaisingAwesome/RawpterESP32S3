@@ -50,6 +50,11 @@
 #define SPI_MOSI 11
 #define SPI_CS GPIO_NUM_10 // Chip select pin for IMU SPI
 
+// Radio PPM
+#define PPM_PIN 21    // input pin for PPM
+#define CHANNELS 6    // number of channels
+#define BLANK_US 4000 // blank time threshold in µs
+
 struct AltitudeData
 {
   BMP581 pressureSensor;
@@ -67,6 +72,7 @@ struct AltitudeData
   volatile float invGroundPressureWorking = 0.0f; // This one is worked by the pressure task and then synced to invGroundPressure variable in the main loop.
   TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
   bool hasBMP581 = false;
+  float sessionHoverPWM =1600;
 };
 
 // GPS

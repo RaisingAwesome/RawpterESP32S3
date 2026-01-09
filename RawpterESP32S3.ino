@@ -71,7 +71,7 @@ static int16_t PWM_roll_fs = 1500;              // it quits turning
 static int16_t PWM_pitch_fs = 1500;             // elev
 static int16_t PWM_yaw_fs = 1500;               // rudd
 static int16_t PWM_ThrottleCutSwitch_fs = 2000; // SWA less than 1300, cut throttle, but we don't want to cut throttle, just allow it to decrease so it lands. - must config a switch to Channel 5 in your remote.
-static int16_t PWM_FailSafed_fs = 2000;         // Used to flag that the receiver had to go to failsafe
+static int16_t PWM_FailSafed_fs = 1500;         // Used to flag that the receiver had to go to failsafe
 static float stick_dampener = 1.0f;             // 0.1-1 Lower=slower, higher=noiser default 0.7
 static float throttleLimit = 0.6f;              // can be overridden with web interface.
 static bool failsafed = false;
@@ -80,7 +80,7 @@ static unsigned long failsafeTime = 0;
 static bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
 static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
 static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
-
+static float failsafeCoeff = 0.0006f;                               // 0.0001 - 0.03 (slow to fast)
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.06f;
 static float recipNorm;
@@ -105,8 +105,8 @@ static const int SwitchB = 6;              // SWB switch, failsafed
 
 static const int throttlePin = stickLeftVertical; // throttle - up and down
 static const int rollPin = stickRightHorizontal;  // ail (roll)
-static const int upDownPin = stickRightVertical;  // elevation (pitch)
-static const int ruddPin = stickLeftHorizontal;   // rudder (yaw)
+static const int pitchPin = stickRightVertical;  // elevation (pitch)
+static const int yawPin = stickLeftHorizontal;   // rudder (yaw)
 static const int throttleCutSwitchPin = SwitchA;  // throttle cut
 static const int failsafePin = SwitchB;           // Receiver failsafed - force a landing
 static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
@@ -117,10 +117,6 @@ static float trimPitch = 0;
 static float trimRoll = 0;
 
 // PPM variables
-#define PPM_PIN 21    // input pin for PPM
-#define CHANNELS 6    // number of channels
-#define BLANK_US 4000 // blank time threshold in µs
-
 static volatile byte state = LOW;
 static volatile byte previous_state = LOW;
 static volatile unsigned long microsAtLastPulse = 0;
@@ -268,7 +264,7 @@ void loopDrone(void *pvParameters)
     PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle
     motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle.
     tock();                                   // Yields until the end of the 500uS pacing is met to sustain 2kHz
-    troubleShooting();
+    //troubleShooting();
   }
 }
 
@@ -303,55 +299,55 @@ void beginAltitudeTask()
 
 inline void setAltitudeRate()
 {
-  const int N = 15;
-  const float dt = 0.01f;
+    const int N = 5;
+    static long lastTime = micros();
+    static float buf[N] = {0};
+    static int i = 0;
+    static bool filled = false;
 
-  static float buf[N] = {0};
-  static int i = 0;
-  static bool filled = false;
-  static int M = 0;
-  static float S_y = 0.0f;  // sum y
-  static float S_ty = 0.0f; // sum k*y, k = age (0 oldest..M-1 newest)
-
-  if (filled)
-  {
-    float y_old = buf[i];                  // oldest lives at i
-    S_y -= y_old;                          // remove oldest
-    S_ty -= 0.0f * y_old;                  // oldest had age 0 (no effect)
-    S_ty -= S_y;                           // shift ages: (k -> k-1) ⇒ S_ty = S_ty - S_y
-    buf[i] = altitudeData.altitudeWorking; // insert newest at age N-1
-    S_y += buf[i];
-    S_ty += (N - 1) * buf[i];
-    i = (i + 1) % N;
-  }
-  else
-  {
+    // Write newest sample at position i
     buf[i] = altitudeData.altitudeWorking;
-    S_y += buf[i];
-    S_ty += M * buf[i]; // newest age = M
     i = (i + 1) % N;
-    M++;
-    if (M == N)
+    if (i == 0) filled = true;
+
+    int m = filled ? N : i;
+    if (m < 2)
     {
-      filled = true;
+        altitudeData.rateFPSWorking = 0.0f;
+        return; // if not yet filled, return.
     }
-  }
 
-  int m = filled ? N : M;
-  if (m < 2)
-  {
-    altitudeData.rateFPSWorking = 0.0f;
-    return;
-  }
+    // t_k = 0..m-1, 0 = oldest, m-1 = newest
+    // Reconstruct in time order
+    float S_y = 0.0f;
+    float S_ty = 0.0f;
+    float S_t = 0.0f;
+    float S_t2 = 0.0f;
 
-  // Precompute time sums for ages 0..m-1
-  float S_t = (m - 1) * m / 2.0f;
-  float S_t2 = (m - 1) * m * (2.0f * m - 1) / 6.0f;
+    for (int k = 0; k < m; ++k)
+    {
+        int idx = (i + k) % N;       // oldest = i, newest = i + m - 1
+        float t = (float)k;
+        float y = buf[idx];
 
-  float denom = (m * S_t2 - S_t * S_t);
-  float slope_per_index = (m * S_ty - S_t * S_y) / denom;
+        S_y  += y;
+        S_ty += t * y;
+        S_t  += t;
+        S_t2 += t * t;
+    }
 
-  altitudeData.rateFPSWorking = slope_per_index / dt;
+    float denom = (m * S_t2 - S_t * S_t);
+    if (denom == 0.0f)
+    {
+        altitudeData.rateFPSWorking = 0.0f;
+        return;
+    }
+
+    float slope_per_index = (m * S_ty - S_t * S_y) / denom;
+    long currentTime = micros();
+    float dt = (currentTime - lastTime) * 1e-6f;   // seconds
+    altitudeData.rateFPSWorking = slope_per_index / dt;
+    lastTime = currentTime;
 }
 
 void bmpTask(void *pvParameters)
@@ -371,14 +367,20 @@ void bmpTask(void *pvParameters)
 
 inline void getAltitude()
 {
-  if (!altitudeData.hasBMP581) return;
   static int flyingCounter = 0;
+  
+  if (!altitudeData.hasBMP581) return;
+  
+  
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
     altitudeData.invGroundPressureWorking = 0.0f; // Reset ground pressure if notified to do so.
+  
   setAltitude();
   setAltitudeRate();
+  
   if (flying && altitudeData.altitudeWorking > altitudeData.highestAltitude)
     altitudeData.highestAltitude = altitudeData.altitudeWorking;
+
   if (altitudeData.altitudeWorking >= 2.0f && !flying)
   {
     if (++flyingCounter > 4) // make sure it is not a blip
@@ -389,6 +391,7 @@ inline void getAltitude()
   }
   else
     flyingCounter = 0;
+  
   xTaskNotifyGive(loopDroneHandle); // Notify the main loop that new data is available
 }
 
@@ -412,7 +415,7 @@ void setAltitude()
     ratio = fmaxf(ratio, 0.000001f);
     // Compute relative altitude in feet
     float newAltitude = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
-    altitudeData.altitudeWorking = 0.6f * altitudeData.altitudeWorking + 0.4f * newAltitude;
+    altitudeData.altitudeWorking += 0.05f * (newAltitude - altitudeData.altitudeWorking);
   }
   else
   {
@@ -457,6 +460,7 @@ void troubleShooting()
   //  printDesiredState();  // Prints desired vehicle state commanded in either degrees or deg/sec (expected: +/- maxAXIS for roll, pitch, yaw; 0 to 1 for throttle)
   //  printGyroData();      // Prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
   //  printAccelData();     // Prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
+  //  printAltitude();      // Print the altitude from the BMP581.
   //  printRollPitchYaw();  // Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
   //  printPIDoutput();     // Prints computed stabilized PID variables from controller and desired setpoint (expected: ~ -1 to 1)
   //  printMotorCommands(); // Prints the values being written to the motors (expected: 1000 to 2000)
@@ -471,11 +475,11 @@ void troubleShooting()
 void setupPressureSensor()
 {
   Serial.println("Setting up BMP581...");
-
+  altitudeData.sessionHoverPWM = failsafeThrottlePWM ; 
   if (altitudeData.pressureSensor.beginI2C(altitudeData.i2cAddress) != BMP5_OK)
   {
     Serial.println("BMP581 not found!");
-    halt();
+    altitudeData.hasBMP581 = false;
     return;
   }
   Serial.println("BMP581 discovered at address 0x46");
@@ -488,7 +492,8 @@ void setupPressureSensor()
   {
     Serial.print("Error setting ODR! Error code: ");
     Serial.println(err);
-    halt();
+    altitudeData.hasBMP581=false;
+    return;
   }
   else
   {
@@ -504,17 +509,19 @@ void setupPressureSensor()
   config.iir_flush_forced_en = BMP5_DISABLE;  // No forced flush
 
   err = altitudeData.pressureSensor.setFilterConfig(&config);
+  vTaskDelay(100);
   if (err != BMP5_OK)
   {
     Serial.print("Error setting filter config! Error code: ");
     Serial.println(err);
-    halt();
+    altitudeData.hasBMP581 = false;
+    return;
   }
   else
   {
     Serial.println("BMP581 Filter configuration applied successfully.");
   }
-  altitudeData.hasBMP581 = false; //Not using for now
+  altitudeData.hasBMP581 = true;
 }
 
 void halt()
@@ -710,12 +717,14 @@ void waitForRadio()
   // Using PWM_throttle_prev so that it is seeded
   PWM_throttle_prev = getRadioPWM(throttlePin, 1520);
   PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
+  PWM_Failsafed = getRadioPWM(SwitchB, 1000);
 
-  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1600 || PWM_ThrottleCutSwitch > 1500) && !EASYCHAIR)
+  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1519 || PWM_ThrottleCutSwitch > 1500 || PWM_Failsafed < 1500) && !EASYCHAIR)
   { // Throttle Cut switch pulled down (flymode) is 2000. Up is 1000 (cut)
     // if the throttle is up or the cut switch is set to Fly (pulled down), then wait until the switches are set.
-    PWM_throttle_prev = getRadioPWM(throttlePin, 2000);              // keep it stuck in the loop if it failsafes
-    PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 1520); // keep it stuck in the loop if it failsafes
+    PWM_throttle_prev = getRadioPWM(throttlePin, 1520);              // keep it stuck in the loop if it failsafes
+    PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
+    PWM_Failsafed = getRadioPWM(failsafePin, 1000);
     tick();
     getIMUdata();
     tock(); // This will warm up the Madgwick while we wait for them to turn on the radio.
@@ -726,8 +735,8 @@ void waitForRadio()
   // This is so the filters don't have to climb up to their true values from zero at their startup
   // which throws off desired values for a brief time.
   PWM_roll_prev = getRadioPWM(rollPin, 1500);
-  PWM_pitch_prev = getRadioPWM(upDownPin, 1500);
-  PWM_yaw_prev = getRadioPWM(ruddPin, 1500);
+  PWM_pitch_prev = getRadioPWM(pitchPin, 1500);
+  PWM_yaw_prev = getRadioPWM(yawPin, 1500);
 }
 
 void setupMotorCommunication()
@@ -918,6 +927,7 @@ void setupIMU()
   else
   {
     Serial.println("IMU SPI communication failed. Check wiring, CS pin, or SPI settings. Trying again.");
+    halt();
     return;
   }
 
@@ -1394,23 +1404,21 @@ inline void getRadioStickValues()
   static bool ceilingOverride = false;
   static float integralAltitudeRate =0;
   
-  // Precomputed constants
-  constexpr int CEILING_PERIOD = 2 * INNER_LOOP_FREQUENCY / ALT_FREQ_HZ; // Get at least 2 barameter samples before overriding by barometer
-  constexpr int ASCENT_PERIOD = 2 * INNER_LOOP_FREQUENCY / ALT_FREQ_HZ;  // Get at least 2 barometer samples before overriding by barometer
-  
   // Read radio PWM
   PWM_throttle = getRadioPWM(throttlePin, 1000);
   PWM_roll = getRadioPWM(rollPin, 1500);
-  PWM_pitch = getRadioPWM(upDownPin, 1500);
-  PWM_yaw = getRadioPWM(ruddPin, 1500);
+  PWM_pitch = getRadioPWM(pitchPin, 1500);
+  PWM_yaw = getRadioPWM(yawPin, 1500);
   PWM_ThrottleCutSwitch = getRadioPWM(SwitchA, 2000);
-  PWM_Failsafed = getRadioPWM(SwitchB, 2000);
+  PWM_Failsafed = getRadioPWM(SwitchB, 1500);
   
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
   // Also, only allow it if in the air to prevent a ground accident.
+  
   if (altitudeData.hasBMP581) 
   {
-    if ( PWM_Failsafed > 1500 && flying && altitudeData.altitude>5 )
+    if (altitudeData.rateFPS > -0.11 && altitudeData.rateFPS < 0.11 && PWM_throttle>1550 && PWM_Failsafed > 1500/*FLipped down*/) altitudeData.sessionHoverPWM = PWM_throttle_prev;
+    if ( PWM_Failsafed < 1900 && flying)
     {
       if (altitudeData.altitude < 0.5f)
       {
@@ -1422,15 +1430,12 @@ inline void getRadioStickValues()
         { 
           throttleOverrideCounter = 0;
           float rateError;
-          if (altitudeData.altitude>12.0f)
-            rateError = -1.0f - altitudeData.rateFPS; // Descent rate is faster if above 12 feet altitude
-          else if (altitudeData.altitude>6.0f)
-            rateError = -0.3f - altitudeData.rateFPS; // Descent rate is slower once between 6 and 12 feet.
-          else
-            rateError = -0.1f - altitudeData.rateFPS; // Descent rate is slower once under feet for a slow landing.
-          integralAltitudeRate += rateError*0.01f;
-          integralAltitudeRate = constrain(integralAltitudeRate,-400,400);
-          PWM_throttle = failsafeThrottlePWM + altitudeData.kp_altitude_rate*rateError + altitudeData.ki_altitude_rate * integralAltitudeRate;
+          rateError = -0.3f - altitudeData.rateFPS; // Descent rate is slower once between 6 and 12 feet.
+          integralAltitudeRate += rateError*0.01f;  // 100 HZ Cycle 
+          float lowend = -500/altitudeData.ki_altitude_rate;
+          float highend = 500/altitudeData.ki_altitude_rate;
+          integralAltitudeRate = constrain(integralAltitudeRate, lowend, highend);
+          PWM_throttle = altitudeData.sessionHoverPWM + altitudeData.kp_altitude_rate*rateError + altitudeData.ki_altitude_rate * integralAltitudeRate;
           PWM_throttle = constrain(PWM_throttle,1500,2000);
           if (PWM_throttle<=1500) killMotors();
         }
@@ -1447,6 +1452,7 @@ inline void getRadioStickValues()
   // Normal smoothing
   throttleOverrideCounter = 0;
   float coeff = (PWM_throttle > PWM_throttle_prev) ? UP_COEFF : DOWN_COEFF;
+  if (!altitudeData.hasBMP581 && PWM_Failsafed < 1900) coeff = failsafeCoeff; // Only use this if dampening if the barameter is not in use.
   PWM_throttle = PWM_throttle_prev + coeff * (PWM_throttle - PWM_throttle_prev);
   // Bottom limit
   if (PWM_throttle < 1500)
@@ -1580,7 +1586,7 @@ void throttleCut()
       // reset (uncut throttle) only if throttle is down to prevent a jolting suprise
       if (PWM_throttle < 1520 && ++throttleNotCutCounter > 10)
       { // The radio is ready for flight and confirmed not to be just a blip.
-        if (PWM_Failsafed > 1500)
+        if (PWM_Failsafed < 1900)
         {
           playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
           throttleNotCutCounter = 0;
@@ -1628,7 +1634,7 @@ void throttleCut()
   }
 
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
-  if (PWM_throttle<1620)
+  if (PWM_throttle<1600)
   {
     if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
     {
@@ -1703,6 +1709,8 @@ void printRadioData()
     Serial.print(getRadioPWM(4, 24)); // Yaw
     Serial.print(F(" CH5: "));
     Serial.println(getRadioPWM(5, 24));
+    Serial.print(F(" CH6: "));
+    Serial.println(getRadioPWM(6, 24));
   }
 }
 
@@ -1747,6 +1755,20 @@ void printAccelData()
     Serial.print(AccY);
     Serial.print(F(" AccZ: "));
     Serial.println(AccZ);
+  }
+}
+
+void printAltitude()
+{
+  if (tick_time - print_counter > 100000)
+  {
+    print_counter = micros();
+    Serial.print(F("Altitude: "));
+    Serial.print(altitudeData.altitude,1);
+    Serial.print(F("  Altitude Rate: "));
+    Serial.print(altitudeData.rateFPS,1);
+    Serial.print(F("  Delta Time:"));
+    Serial.println(deltaTime * 1000000.0);
   }
 }
 
@@ -2230,6 +2252,11 @@ void setValuesFromUserForm(String req)
       UP_COEFF = value.toFloat();
       UP_COEFF = constrain(UP_COEFF, 0.0, 1.0);
     }
+    else if (key == "failsafeCoeff")
+    {
+      failsafeCoeff = value.toFloat();
+      failsafeCoeff = constrain(failsafeCoeff, 0.00001, .03);
+    }
     else if (key == "DOWN_COEFF")
     {
       DOWN_COEFF = value.toFloat();
@@ -2302,12 +2329,14 @@ void saveParameters()
   throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
   UP_COEFF = constrain(UP_COEFF,0.0,1.0); //protect from a fat finger
   DOWN_COEFF = constrain(DOWN_COEFF,0.0,1.0); //protect from a fat finger
+  failsafeCoeff = constrain(failsafeCoeff, 0.00001, 0.03);
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
   prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
   prefs.putFloat("ceiling", altitudeData.ceiling);
   prefs.putFloat("throttleLimit", throttleLimit);
   prefs.putFloat("UP_COEFF", UP_COEFF);
   prefs.putFloat("DOWN_COEFF", DOWN_COEFF);
+  prefs.putFloat("failsafeCoeff", failsafeCoeff);
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("trimPitch", trimPitch);
@@ -2357,6 +2386,7 @@ void loadParameters()
   throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
   UP_COEFF = prefs.getFloat("UP_COEFF", UP_COEFF);
   DOWN_COEFF = prefs.getFloat("DOWN_COEFF", DOWN_COEFF);
+  failsafeCoeff = prefs.getFloat("failsafeCoeff", failsafeCoeff);
   stick_dampener = prefs.getFloat("stick_dampener", stick_dampener);
   i_limit_angle = prefs.getFloat("i_limit_angle", i_limit_angle);
   i_limit_rate = prefs.getFloat("i_limit_rate", i_limit_rate);
@@ -2484,6 +2514,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(throttleLimit, 2) + "'></td></tr>";
   body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(UP_COEFF, 3) + "'></td></tr>";
   body += "<tr><td>Down Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 3) + "'></td></tr>";
+  body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(failsafeCoeff, 6) + "'></td></tr>";
   body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(stick_dampener, 3) + "'></td></tr>";
   body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(Accel_filter) + "'></td></tr>";
   body += "<tr><td>Gyro Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Gyro_filter style='width:80px;' value='" + String(Gyro_filter) + "'></td></tr>";
