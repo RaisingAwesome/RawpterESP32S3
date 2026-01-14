@@ -73,6 +73,9 @@ struct AltitudeData
   TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
   bool hasBMP581 = false;
   float sessionHoverPWM =1600;
+  float targetRateLanding = -0.1f; // ft/sec
+  float upGain = 4.0f; // How hared to push back up if descend too quickly on landing
+  float fastestAscent = 0.0f; // ft/sec
 };
 
 // GPS

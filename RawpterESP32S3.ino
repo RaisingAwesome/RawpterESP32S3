@@ -81,6 +81,7 @@ static bool throttle_is_cut = true; // used to force the pilot to manually set t
 static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
 static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
 static float failsafeCoeff = 0.0006f;                               // 0.0001 - 0.03 (slow to fast)
+
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.06f;
 static float recipNorm;
@@ -151,6 +152,7 @@ static unsigned long tick_time, prev_time;
 static unsigned long print_counter, serial_counter;
 static volatile unsigned long debugger;
 static bool flying = false;
+static bool playingSong = false;
 TaskHandle_t loopDroneHandle; // Handle for the main drone control loop task that will run on its own core.
 
 // Radio communication:
@@ -170,13 +172,22 @@ constexpr float USEC_TO_SEC = 1.0f / 1000000.0f;
 static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
 static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
 static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
-
+/* Big drone
 static float AccErrorX = 0.01;
 static float AccErrorY = -0.03;
 static float AccErrorZ = 0.01;
 static float GyroErrorX = 0.55;
 static float GyroErrorY = -0.85;
 static float GyroErrorZ = 0.63;
+*/
+
+// Little Drone
+static float AccErrorX = -0.01;
+static float AccErrorY = 0.02;
+static float AccErrorZ = -0.01;
+static float GyroErrorX = -1.02;
+static float GyroErrorY = 0.38;
+static float GyroErrorZ = 0.55;
 
 static SPIClass IMUSPI(HSPI);
 
@@ -221,18 +232,16 @@ void setup()
   setupMotorCommunication(); // Sets up ledc channels for motor control
   beginBuzzerTask();        // Setup pin for reading the Battery
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
-  analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
-  Wire.begin(8, 9);
-  delay(100);
-  Wire.setClock(400000); // 400KhZ I2C
+  setupPeripherals();
   beginWifiTask();
   setupGPS();
   setupPressureSensor();
   setupIMU();
-  // calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
+  //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   Serial.println("Waiting for Radio");
   delay(100);
   playStartSong();
+  // motorTest(); //Used to check rotation on the bench. NO PROPS!
   if (!EASYCHAIR)
     waitForRadio();
   Serial.println("Ready...");
@@ -271,7 +280,15 @@ void loopDrone(void *pvParameters)
 // ========================================================================================================================//
 //                                                      FUNCTIONS                                                         //
 // ========================================================================================================================//
-void syncAltitude()
+void setupPeripherals()
+{
+  analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
+  Wire.begin(8, 9); // I2C communication on pin 8 and 9
+  delay(100);
+  Wire.setClock(400000); // 400KhZ I2C
+}
+
+inline void syncAltitude()
 { // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
   // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
   if (!altitudeData.hasBMP581) return;
@@ -291,63 +308,39 @@ void beginAltitudeTask()
       "BMP581 Task",               // Name
       4096,                        // Stack size (bytes)
       NULL,                        // Parameters
-      1,                           // Priority (lower than PID loop)
+      1,                           // Priority (Highest priority on core)
       &altitudeData.bmpTaskHandle, // Task handle
       0                            // Core 0 since it is slower overall
   );
 }
 
-inline void setAltitudeRate()
+void beginWifiTask()
 {
-    const int N = 5;
-    static long lastTime = micros();
-    static float buf[N] = {0};
-    static int i = 0;
-    static bool filled = false;
+  // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
+  // on its own core.
+  xTaskCreatePinnedToCore(
+    wifiTask,        // Task function
+    "Wifi Task",               // Name
+    4096,                        // Stack size (bytes)
+    NULL,                        // Parameters
+    2,                           // Priority (pressure)
+    &wifiTaskHandle, // Task handle
+    0                            // Core 0 since it is slower overall
+  );
+}
 
-    // Write newest sample at position i
-    buf[i] = altitudeData.altitudeWorking;
-    i = (i + 1) % N;
-    if (i == 0) filled = true;
-
-    int m = filled ? N : i;
-    if (m < 2)
-    {
-        altitudeData.rateFPSWorking = 0.0f;
-        return; // if not yet filled, return.
-    }
-
-    // t_k = 0..m-1, 0 = oldest, m-1 = newest
-    // Reconstruct in time order
-    float S_y = 0.0f;
-    float S_ty = 0.0f;
-    float S_t = 0.0f;
-    float S_t2 = 0.0f;
-
-    for (int k = 0; k < m; ++k)
-    {
-        int idx = (i + k) % N;       // oldest = i, newest = i + m - 1
-        float t = (float)k;
-        float y = buf[idx];
-
-        S_y  += y;
-        S_ty += t * y;
-        S_t  += t;
-        S_t2 += t * t;
-    }
-
-    float denom = (m * S_t2 - S_t * S_t);
-    if (denom == 0.0f)
-    {
-        altitudeData.rateFPSWorking = 0.0f;
-        return;
-    }
-
-    float slope_per_index = (m * S_ty - S_t * S_y) / denom;
-    long currentTime = micros();
-    float dt = (currentTime - lastTime) * 1e-6f;   // seconds
-    altitudeData.rateFPSWorking = slope_per_index / dt;
-    lastTime = currentTime;
+void beginBuzzerTask()
+{
+  // Start task that handles communication with the buzzer.
+  xTaskCreatePinnedToCore(
+    buzzerTask,        // Task function
+    "Buzzer Task",               // Name
+    4096,                        // Stack size (bytes)
+    NULL,                        // Parameters
+    3,                           // Priority (lowest priority of pressure, wifi, buzzer)
+    &buzzerTaskHandle,            // Task handle
+    0                            // Core 0 since it is slower overall
+  );
 }
 
 void bmpTask(void *pvParameters)
@@ -371,7 +364,6 @@ inline void getAltitude()
   
   if (!altitudeData.hasBMP581) return;
   
-  
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
     altitudeData.invGroundPressureWorking = 0.0f; // Reset ground pressure if notified to do so.
   
@@ -380,7 +372,8 @@ inline void getAltitude()
   
   if (flying && altitudeData.altitudeWorking > altitudeData.highestAltitude)
     altitudeData.highestAltitude = altitudeData.altitudeWorking;
-
+  if (altitudeData.fastestAscent < altitudeData.rateFPSWorking)
+    altitudeData.fastestAscent = altitudeData.rateFPSWorking;
   if (altitudeData.altitudeWorking >= 2.0f && !flying)
   {
     if (++flyingCounter > 4) // make sure it is not a blip
@@ -393,6 +386,39 @@ inline void getAltitude()
     flyingCounter = 0;
   
   xTaskNotifyGive(loopDroneHandle); // Notify the main loop that new data is available
+}
+
+inline void setAltitudeRate()
+{
+    static long lastTime = micros();
+    static float lastAltitude = 0.0f;
+    static bool first = true;
+
+    long currentTime = micros();
+    float currentAltitude = altitudeData.altitudeWorking;
+
+    if (first)
+    {
+        // No prior sample yet
+        altitudeData.rateFPSWorking = 0.0f;
+        lastAltitude = currentAltitude;
+        lastTime = currentTime;
+        first = false;
+        return;
+    }
+
+    float dt = (currentTime - lastTime) * 1e-6f;   // seconds
+    if (dt <= 0.0f)
+    {
+        altitudeData.rateFPSWorking = 0.0f;
+        return;
+    }
+
+    float dy = currentAltitude - lastAltitude;     // feet
+    altitudeData.rateFPSWorking = dy / dt;         // feet per second
+
+    lastAltitude = currentAltitude;
+    lastTime = currentTime;
 }
 
 void setAltitude()
@@ -415,41 +441,12 @@ void setAltitude()
     ratio = fmaxf(ratio, 0.000001f);
     // Compute relative altitude in feet
     float newAltitude = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
-    altitudeData.altitudeWorking += 0.05f * (newAltitude - altitudeData.altitudeWorking);
+    altitudeData.altitudeWorking += 0.70f * (newAltitude - altitudeData.altitudeWorking);  //1.0 would make newAltitude be the current value, .1 would make the prior value hold the most weight
   }
   else
   {
     altitudeData.altitudeWorking = 0.0f; // fallback if sensor read fails
   }
-}
-
-void beginWifiTask()
-{
-  // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
-  // on its own core.
-  xTaskCreatePinnedToCore(
-    wifiTask,        // Task function
-    "Wifi Task",               // Name
-    4096,                        // Stack size (bytes)
-    NULL,                        // Parameters
-    1,                           // Priority (lower than PID loop)
-    &wifiTaskHandle, // Task handle
-    0                            // Core 0 since it is slower overall
-  );
-}
-
-void beginBuzzerTask()
-{
-  // Start task that handles communication with the buzzer.
-  xTaskCreatePinnedToCore(
-    buzzerTask,        // Task function
-    "Buzzer Task",               // Name
-    4096,                        // Stack size (bytes)
-    NULL,                        // Parameters
-    1,                           // Priority (lower than PID loop)
-    &buzzerTaskHandle,            // Task handle
-    0                            // Core 0 since it is slower overall
-  );
 }
 
 void troubleShooting()
@@ -751,7 +748,7 @@ void setupMotorCommunication()
 
   Serial.println("Set up ledc for Motor Communication.");
 
-  //calibrateESCs(); ONLY ENABLE WITHOUT PROPS!!!!!!!!!! This is written in blood!
+  //calibrateESCs(); //ONLY ENABLE WITHOUT PROPS!!!!!!!!!! This is written in blood!
 
   m1_command_PWM = 1000; // Will send the default for motor stopped for Simonk firmware
   m2_command_PWM = 1000;
@@ -785,7 +782,7 @@ void playStartSong()
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {200, 200, 200, 580, 690, 200, 400, 200, 400, 200, 400, 200, 1200};
-
+  playingSong = true;
   for (int i = 0; i < 13; i++)
   {
     int duration = noteDurations[i];
@@ -795,6 +792,7 @@ void playStartSong()
     ledcWriteTone(BUZZER_PIN, 0);
     delay(duration * .2);
   }
+  playingSong = false;
 }
 
 void playReadySong()
@@ -816,6 +814,7 @@ void playReadySong()
 }
 void playNope()
 {
+  playingSong = true;
   // Melody (first bar of Danger Zone, simplified)
   int melody[] = {Note_FS4, Note_FS4};
 
@@ -830,12 +829,18 @@ void playNope()
     ledcWriteTone(BUZZER_PIN, 0);
     delay(duration * .8);
   }
+  playingSong = false;
 }
 inline void loopBuzzer()
 { // this monitors the battery.  the lower it gets, the faster it beeps.
   // disabling for now until we get the wiring correct in the next version
   static unsigned long buzzer_spacing = 30000;
   unsigned long myTime = millis();
+  if (playingSong) return;
+  if (PWM_Failsafed < 1500)
+    buzzer_spacing = 100;
+  else 
+    buzzer_spacing = 30000;
 
   if (!beeping)
   {
@@ -855,12 +860,12 @@ inline void loopBuzzer()
       ledcWriteTone(BUZZER_PIN, 0);
     }
   }
-
+  /*
   if (myTime > next_voltage_check)
   {
     next_voltage_check = myTime + 30000; // checkvoltage once every 10 seconds versus every loop.
     buzzer_spacing = 30000;
-    /*
+   
     batteryVoltage = analogRead(BATTERY_PIN);
     if (BATTERYTYPE == 14.8) {
       // based on 330K and 51K voltage divider that takes 16.8V to 2.25V
@@ -881,8 +886,8 @@ inline void loopBuzzer()
       else if (batteryVoltage > 1301) buzzer_spacing = 500;
       else buzzer_spacing = 100;
     }
-    */
   }
+  */
 }
 
 void setupSerial()
@@ -1401,9 +1406,10 @@ void AngleLoopCalcs()
 inline void getRadioStickValues()
 {
   static int throttleOverrideCounter = 0;
-  static bool ceilingOverride = false;
-  static float integralAltitudeRate =0;
-  
+  static bool landing = false;
+  static float integralAltitudeRate = 0 ;
+  static unsigned long landingTime = 0;
+
   // Read radio PWM
   PWM_throttle = getRadioPWM(throttlePin, 1000);
   PWM_roll = getRadioPWM(rollPin, 1500);
@@ -1413,34 +1419,70 @@ inline void getRadioStickValues()
   PWM_Failsafed = getRadioPWM(SwitchB, 1500);
   
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
-  // Also, only allow it if in the air to prevent a ground accident.
+  // Also, only allow killMotors if flying to prevent a ground accident when worm burning.
   
   if (altitudeData.hasBMP581) 
   {
-    if (altitudeData.rateFPS > -0.11 && altitudeData.rateFPS < 0.11 && PWM_throttle>1550 && PWM_Failsafed > 1500/*FLipped down*/) altitudeData.sessionHoverPWM = PWM_throttle_prev;
-    if ( PWM_Failsafed < 1900 && flying)
-    {
-      if (altitudeData.altitude < 0.5f)
-      {
-        killMotors();
-      }
-      else
-      {
-        if (++throttleOverrideCounter>=INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // loop at the same frequency as the altitude checks
-        { 
-          throttleOverrideCounter = 0;
-          float rateError;
-          rateError = -0.3f - altitudeData.rateFPS; // Descent rate is slower once between 6 and 12 feet.
-          integralAltitudeRate += rateError*0.01f;  // 100 HZ Cycle 
-          float lowend = -500/altitudeData.ki_altitude_rate;
-          float highend = 500/altitudeData.ki_altitude_rate;
-          integralAltitudeRate = constrain(integralAltitudeRate, lowend, highend);
-          PWM_throttle = altitudeData.sessionHoverPWM + altitudeData.kp_altitude_rate*rateError + altitudeData.ki_altitude_rate * integralAltitudeRate;
-          PWM_throttle = constrain(PWM_throttle,1500,2000);
-          if (PWM_throttle<=1500) killMotors();
+    if (PWM_Failsafed < 1900 /*landing*/ && flying)
+    {   
+        if (!landing)
+        {
+          landingTime = millis();
+          landing = true;
         }
-        else PWM_throttle=PWM_throttle_prev;
-      }
+        unsigned long currentTime = millis();
+
+        if (currentTime - landingTime > 5000) 
+        {
+          killMotors(); // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
+          landing=false;
+          return;
+        }
+        if (altitudeData.altitude < 1.5f)
+        {
+            killMotors();
+            landing = false;
+            return;
+        }
+        else
+        {
+            if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ)
+            { 
+                throttleOverrideCounter = 0;
+                float landingRate = altitudeData.targetRateLanding;
+                if (altitudeData.altitude>20) landingRate = 1.5f;
+                else if (altitudeData.altitude>10) landingRate = 0.8f;
+                
+                float rateError  = landingRate - altitudeData.rateFPS;
+
+                // Integrator
+                integralAltitudeRate += rateError * 0.01f;  // 100 Hz
+
+                // Don't accululate beyond PWM limits so you don't over saturate the integral.
+                float lowend  = -(altitudeData.sessionHoverPWM-1500) / altitudeData.ki_altitude_rate;
+                float highend =  (2000 - altitudeData.sessionHoverPWM) / (altitudeData.upGain * altitudeData.ki_altitude_rate);
+                integralAltitudeRate = constrain(integralAltitudeRate, lowend, highend);
+
+                // Asymmetric gain: more aggressive when descent is too fast (rateError > 0)
+                float upGain = (rateError > 0.0f) ? altitudeData.upGain : 1.0f;
+
+                float pwm = altitudeData.sessionHoverPWM
+                          + upGain * altitudeData.kp_altitude_rate * rateError
+                          + upGain * altitudeData.ki_altitude_rate * integralAltitudeRate;
+
+                PWM_throttle = constrain(pwm, 1500, 2000);
+                if (PWM_throttle <= 1500) killMotors();
+            }
+            else
+            {
+                PWM_throttle = PWM_throttle_prev;
+            }
+        }
+    }
+    else 
+    {
+      throttleOverrideCounter = 0;
+      landing = false;
     }
   }
 
@@ -1450,9 +1492,8 @@ inline void getRadioStickValues()
     lowestThrottlePWM = PWM_throttle;
 
   // Normal smoothing
-  throttleOverrideCounter = 0;
   float coeff = (PWM_throttle > PWM_throttle_prev) ? UP_COEFF : DOWN_COEFF;
-  if (!altitudeData.hasBMP581 && PWM_Failsafed < 1900) coeff = failsafeCoeff; // Only use this if dampening if the barameter is not in use.
+  if (PWM_Failsafed < 1900) coeff = failsafeCoeff; // Override the stick dampening to not mess up the PID loop
   PWM_throttle = PWM_throttle_prev + coeff * (PWM_throttle - PWM_throttle_prev);
   // Bottom limit
   if (PWM_throttle < 1500)
@@ -1545,13 +1586,6 @@ inline void calibrateESCs()
   // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  It takes around 8 seconds.
   return; //only do without props
   /*
-  uint32_t raw = radio.getChannel(4);
-  Serial.print("Radio Cut PWM: ");
-  Serial.println(raw);
-
-  if (getRadioPWM(throttleCutSwitchPin, 1000) <= 1500)
-    return; // throttle cut switch down, then run the calibration. If up, skip it.
-
   Serial.println("Calibrating ESCs...");
   ESCWriteMicroseconds(m1Pin, 2000);
   ESCWriteMicroseconds(m2Pin, 2000);
@@ -1601,6 +1635,7 @@ void throttleCut()
           lowestThrottlePWM = 2000;
           highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
+          altitudeData.fastestAscent = 0.0f;
           if (gps.hasGPS)
           {
             gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
@@ -1642,6 +1677,7 @@ void throttleCut()
       return;
     }
   } 
+
   if (altitudeData.hasBMP581)
   {
     if (!flying || altitudeData.altitude < 2) // this is tip over protection at take-off
@@ -1979,7 +2015,7 @@ void beginDroneLoopTask()
       "Drone Loop Task", // Name
       4096,              // Stack size
       NULL,              // Parameters
-      2,                 // Priority (higher than BMP task)
+      1,                 // Priority (higher than BMP task)
       &loopDroneHandle,  // Task handle
       1                  // Pin to core 1, its faster
   );
@@ -2003,8 +2039,8 @@ void buzzerTask(void *pvParameters)
   while (true)
   {
     // Do the sensor read
-    if (throttle_is_cut) loopBuzzer();
-    vTaskDelay(500);
+    loopBuzzer();
+    vTaskDelay(100);
   }
 }
 void setupWiFi()
@@ -2235,6 +2271,8 @@ void setValuesFromUserForm(String req)
       failsafeThrottlePWM = value.toInt();
     else if (key == "kp_altitude_rate") altitudeData.kp_altitude_rate = value.toFloat();
     else if (key == "ki_altitude_rate") altitudeData.ki_altitude_rate = value.toFloat();
+    else if (key == "upGain") altitudeData.upGain = value.toFloat();
+    else if (key == "targetRateLanding") altitudeData.targetRateLanding = value.toFloat();
     else if (key == "ceiling") altitudeData.ceiling = value.toFloat();
     else if (key == "trimPitch")
       trimPitch = value.toFloat();
@@ -2339,6 +2377,8 @@ void saveParameters()
   prefs.putFloat("failsafeCoeff", failsafeCoeff);
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
+  prefs.putFloat("upGain" , altitudeData.upGain);
+  prefs.putFloat("targetRateLanding", altitudeData.targetRateLanding);
   prefs.putFloat("trimPitch", trimPitch);
   prefs.putFloat("trimRoll", trimRoll);
   prefs.putFloat("trimYaw", trimYaw);
@@ -2378,6 +2418,8 @@ void loadParameters()
   failsafeThrottlePWM = prefs.getInt("fsThrottlePWM", failsafeThrottlePWM);
   altitudeData.kp_altitude_rate = prefs.getFloat("kpaltrate", altitudeData.kp_altitude_rate);
   altitudeData.ki_altitude_rate = prefs.getFloat("kialtrate", altitudeData.ki_altitude_rate);
+  altitudeData.targetRateLanding = prefs.getFloat("targetRateLanding", altitudeData.targetRateLanding);
+  altitudeData.upGain = prefs.getFloat("upGain", altitudeData.upGain);
   altitudeData.ceiling = prefs.getFloat("ceiling", altitudeData.ceiling);
   trimPitch = prefs.getFloat("trimPitch", trimPitch);
   trimRoll = prefs.getFloat("trimRoll", trimRoll);
@@ -2453,7 +2495,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Desired Roll=" + String(roll_des) + "&#176;</td><td>IMU Roll=" + String(roll_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Desired Pitch=" + String(pitch_des) + "&#176;</td><td>IMU Pitch=" + String(pitch_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Loop Time=" + String(int(round((deltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(PWM_throttle) + "</td></tr>";
-  body += "<tr><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td><td></td></tr>";
+  body += "<tr><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
   body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(highestThrottlePWM) + "</td></tr>";
   body += "<tr><td>Lowest Throttle=" + String(lowestThrottlePWM) + "</td><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td></tr>";
   body += "<tr><td>Longitude = " + String(gps.longitude,2) + "&#176;</td><td>Latitude = " + String(gps.latitude, 2) + "&#176;</td></tr>";
@@ -2506,6 +2548,8 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<table>";
   body += "<tr><td>Ceiling:</td><td><input type=number name=ceiling style='width:80px;' step = .1 value='" + String(altitudeData.ceiling,1) + "'></td></tr>";
   body += "<tr><td>Land Mode Start Throttle (1500 to 2000):</td><td><input type=number name=failsafeThrottlePWM style='width:80px;' value='" + String(failsafeThrottlePWM) + "'></td></tr>";
+  body += "<tr><td>Landing Target Rate (ft/sec):</td><td><input type=number name=targetRateLanding style='width:100px;' step = .01 value='" + String(altitudeData.targetRateLanding,2) + "'></td></tr>";
+  body += "<tr><td>Landing Up Gain Multiplier:</td><td><input type=number name=upGain style='width:100px;' step = .01 value='" + String(altitudeData.upGain,2) + "'></td></tr>";
   body += "<tr><td>Kp Altitude Rate:</td><td><input type=number name=kp_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.kp_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Ki Altitude Rate:</td><td><input type=number name=ki_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.ki_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Trim - Pitch (-500 to 500):</td><td><input type=number name=trimPitch style='width:80px;' value='" + String(trimPitch) + "'></td></tr>";
@@ -2513,7 +2557,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(trimYaw) + "'></td></tr>";
   body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(throttleLimit, 2) + "'></td></tr>";
   body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(UP_COEFF, 3) + "'></td></tr>";
-  body += "<tr><td>Down Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 3) + "'></td></tr>";
+  body += "<tr><td>Down Dampening (0.0001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.0001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 4) + "'></td></tr>";
   body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(failsafeCoeff, 6) + "'></td></tr>";
   body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(stick_dampener, 3) + "'></td></tr>";
   body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(Accel_filter) + "'></td></tr>";
@@ -2551,3 +2595,23 @@ void GenerateDefaultPage(WiFiClient &client)
   client.write((const uint8_t *)body.c_str(), body.length());  
   //Serial.println("Made Web Page.");
 }
+
+/*
+void motorTest()
+{ // Used to check rotation on the bench. NO PROPS!
+  return;
+  for (int ii=0;ii<5;ii++)
+  {
+    ESCWriteMicroseconds(m1Pin, 1000);
+    ESCWriteMicroseconds(m2Pin, 1000);
+    ESCWriteMicroseconds(m3Pin, 1000);
+    ESCWriteMicroseconds(m4Pin, 1000);
+    delay(2000);
+    ESCWriteMicroseconds(m1Pin, 1100);
+    ESCWriteMicroseconds(m2Pin, 1100);
+    ESCWriteMicroseconds(m3Pin, 1100);
+    ESCWriteMicroseconds(m4Pin, 1100);
+    delay(2000);
+  }
+}
+*/
