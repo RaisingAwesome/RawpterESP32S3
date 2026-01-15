@@ -141,6 +141,7 @@ static const int m4Pin = 4; // IO4
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
 GPSData gps{};
+HomePosition homePos{};
 AltitudeData altitudeData{};
 
 // General stuff for controlling timing of things
@@ -230,11 +231,11 @@ void setup()
   setupSerial();             // Sets up both Serial and Serial1 for communication.
   setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
   setupMotorCommunication(); // Sets up ledc channels for motor control
-  beginBuzzerTask();        // Setup pin for reading the Battery
+  beginBuzzerTask();         // Setup pin for reading the Battery
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   setupPeripherals();
   beginWifiTask();
-  setupGPS();
+  setupGPS();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
   setupPressureSensor();
   setupIMU();
   //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
@@ -323,7 +324,7 @@ void beginWifiTask()
     "Wifi Task",               // Name
     4096,                        // Stack size (bytes)
     NULL,                        // Parameters
-    2,                           // Priority (pressure)
+    3,                           // Priority (pressure)
     &wifiTaskHandle, // Task handle
     0                            // Core 0 since it is slower overall
   );
@@ -337,10 +338,42 @@ void beginBuzzerTask()
     "Buzzer Task",               // Name
     4096,                        // Stack size (bytes)
     NULL,                        // Parameters
-    3,                           // Priority (lowest priority of pressure, wifi, buzzer)
+    4,                           // Priority (lowest priority of pressure, wifi, buzzer)
     &buzzerTaskHandle,            // Task handle
     0                            // Core 0 since it is slower overall
   );
+}
+
+void beginGPSTask()
+{
+  // Start task that handles communication with the buzzer.
+  xTaskCreatePinnedToCore(
+    gpsTask,        // Task function
+    "GPS Task",               // Name
+    4096,                        // Stack size (bytes)
+    NULL,                        // Parameters
+    2,                           // Priority (lowest priority of pressure, wifi, buzzer)
+    &gps.gpsTaskHandle,            // Task handle
+    0                            // Core 0 since it is slower overall
+  );
+}
+
+void gpsTask(void *pvParameters)
+{
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(1000); // 1 Hz
+
+  while (true)
+  {
+    // Do the sensor read
+    gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
+    gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
+    gps.fixType = gps.Max10SGPS.getFixType();
+    if (homePos.valid && gps.hasGPS && gps.fixType >= 3) gps.useGPS = true;
+    else gps.useGPS = false;  
+    // Delay until the next absolute 200 ms boundary
+    vTaskDelayUntil(&lastWakeTime, period);
+  }
 }
 
 void bmpTask(void *pvParameters)
@@ -571,7 +604,8 @@ void setupGPS()
 
   // Send raw UBX message
   gps.Max10SGPS.pushRawData(ubxTP5, sizeof(ubxTP5));
-
+  delay(100);
+  beginGPSTask();
   Serial.println("UBX-CFG-TP5 sent: TIMEPULSE enabled at 1 Hz.");
 }
 
@@ -1429,30 +1463,28 @@ inline void getRadioStickValues()
         {
           landingTime = millis();
           landing = true;
+          gpsData.atHome = false; // reset atHome flag to false to ensure heading home.
         }
         unsigned long currentTime = millis();
 
-        if (currentTime - landingTime > 5000) 
+        if (currentTime - landingTime > 5000 || altitudeData.altitude < 1.5f) 
         {
           killMotors(); // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
           landing=false;
           return;
         }
-        if (altitudeData.altitude < 1.5f)
-        {
-            killMotors();
-            landing = false;
-            return;
-        }
         else
         {
+            headHome(); // this will override pitch and roll PWM to head home.
+            
             if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ)
             { 
                 throttleOverrideCounter = 0;
                 float landingRate = altitudeData.targetRateLanding;
-                if (altitudeData.altitude>20) landingRate = 1.5f;
-                else if (altitudeData.altitude>10) landingRate = 0.8f;
-                
+                if (gpsData.useGPS && !gpsData.atHome && altitudeData.altitude < 12.0f)
+                {
+                    landingRate = 0.0f;
+                }
                 float rateError  = landingRate - altitudeData.rateFPS;
 
                 // Integrator
@@ -1511,6 +1543,46 @@ inline void getRadioStickValues()
   PWM_yaw_prev = PWM_yaw;
 }
 
+inline void headHome()
+{
+  // ---------------- HORIZONTAL RTL ----------------
+  if (gps.useGPS)
+  {
+    float errN, errE;
+    gpsData.useGPS = true;
+    gpsErrorToNE(gpsData.latitude, gpsData.longitude,
+                 homePos.lat_deg, homePos.lon_deg,
+                 errN, errE);
+
+    float dist2 = errN*errN + errE*errE;
+
+    if (dist2 > 1.0f)   // more than ~1 m away
+    {
+        // Convert position error → stick PWM
+        const float K_pos2pwm = 50.0f;  // tune
+
+        float pitchOffset = -K_pos2pwm * errN;  // north = pitch forward
+        float rollOffset  =  K_pos2pwm * errE;  // east = roll right
+
+        float pitchCmd = 1500.0f + pitchOffset;
+        float rollCmd  = 1500.0f + rollOffset;
+
+        pitchCmd = constrain(pitchCmd, 1300.0f, 1700.0f);
+        rollCmd  = constrain(rollCmd, 1300.0f, 1700.0f);
+        gpsData.atHome = false;
+        PWM_pitch = pitchCmd;
+        PWM_roll  = rollCmd;
+    }
+    else
+    {
+        // Close enough to home → level out
+        PWM_pitch = 1500;
+        PWM_roll  = 1500;
+        gpsData.atHome = true;
+    }
+  }
+// ------------------------------------------------
+}
 inline void setToFailsafe()
 {
   // This would only be called if the receiver itself had a major problem or is not set to failsafe
@@ -1636,13 +1708,8 @@ void throttleCut()
           highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
           altitudeData.fastestAscent = 0.0f;
-          if (gps.hasGPS)
-          {
-            gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
-            gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
-            gps.fixType = gps.Max10SGPS.getFixType();
-          }
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
+          setHome();         // Set home position on throttle uncut.
           MadgwickInit();     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
         }
@@ -1658,12 +1725,6 @@ void throttleCut()
       throttle_is_cut = true;
       flying = false;
       killMotors();
-      if (gps.hasGPS)
-      {
-        gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
-        gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
-        gps.fixType = gps.Max10SGPS.getFixType();
-      }
     }
     return;
   }
@@ -1692,6 +1753,32 @@ void throttleCut()
   }
   throttleNotCutCounter = 0;
   throttleCutCounter = 0;
+}
+
+void setHome()
+{
+  if (gpsData.hasGPS && gpsData.fixType >= 3)
+  {
+      homePos.lat_deg = gpsData.latitude;
+      homePos.lon_deg = gpsData.longitude;
+      homePos.valid = true;
+  } else {
+      homePos.valid = false;
+  }
+}
+
+inline void gpsErrorToNE(double lat_now, double lon_now,
+                         double lat_home, double lon_home,
+                         float &errN_m, float &errE_m)
+{
+    const double deg2rad = 0.017453292519943295;
+    double dLat = (lat_home - lat_now) * deg2rad;
+    double dLon = (lon_home - lon_now) * deg2rad;
+    double latRad = lat_now * deg2rad;
+
+    double R = 6378137.0; // Earth radius
+    errN_m = (float)(R * dLat);
+    errE_m = (float)(R * cos(latRad) * dLon);
 }
 
 void killMotors()

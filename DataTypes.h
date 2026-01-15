@@ -82,10 +82,20 @@ struct AltitudeData
 struct GPSData
 {
   bool hasGPS = false;
+  bool useGPS = false;
   SFE_UBLOX_GNSS Max10SGPS;
   double longitude = 0;
   double latitude = 0;
   uint8_t fixType = 0;
+  TaskHandle_t gpsTaskHandle = nullptr; // Handle for the GPS task that will run on its own core.
+  bool atHome = false;
+};
+
+struct HomePosition
+{
+    bool valid = false;
+    double lat_deg = 0;
+    double lon_deg = 0;
 };
 
 struct Limits
