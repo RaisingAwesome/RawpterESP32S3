@@ -1583,6 +1583,7 @@ inline void headHome()
   }
 // ------------------------------------------------
 }
+
 inline void setToFailsafe()
 {
   // This would only be called if the receiver itself had a major problem or is not set to failsafe
