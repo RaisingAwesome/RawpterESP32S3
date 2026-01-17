@@ -20,5 +20,3 @@ Rawpter is a custom flight controller for a quadcopter. It is based on the ESP32
 - Battery Voltage monitoring and buzzer signalling
 - iBus Communication to Radio Transmitter
 - GPS (TBD)
-
-  

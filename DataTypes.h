@@ -86,8 +86,9 @@ struct GPSData
   SFE_UBLOX_GNSS Max10SGPS;
   double longitude = 0;
   double latitude = 0;
+  double longitudeWorking = 0;
+  double latitudeWorking = 0;
   uint8_t fixType = 0;
-  TaskHandle_t gpsTaskHandle = nullptr; // Handle for the GPS task that will run on its own core.
   bool atHome = false;
 };
 

@@ -18,18 +18,18 @@
 // EASYCHAIR is used to put in some key dummy variables so you can sit in the easy chair with just the Arduino on a cord wiggling it around and seeing how it responds.
 // Set EASYCHAIR to false when you are wanting to install it in the drone.
 #define EASYCHAIR false
-
-#define INNER_LOOP_FREQUENCY 2000.0f // The altitude read takes out of processing time. Could get 2K easy if not for it.
-#define IMU_FREQ_HZ 2000.0f          // We will get the IMU data as fast as the inner loop so that we can apply our filters to any noise.
-#define PID_FREQ_HZ 400.0f           // This is limited by how fast your ESCs can change setpoint.
-#define MOTOR_FREQ_HZ 400.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point.
+#define INNER_LOOP_FREQUENCY 1000.0f // The altitude read takes out of processing time. Could get 2K easy if not for it.
+#define IMU_FREQ_HZ 1000.0f          // We will get the IMU data as fast as the inner loop so that we can apply our filters to any noise.
+#define PID_FREQ_HZ 250.0f           // This is limited by how fast your ESCs can change setpoint.
+#define MOTOR_FREQ_HZ 250.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point. 250 will evenly put it in the inner loop
 #define RAMP_DURATION_SEC 0.35f      // how long in seconds to take a command a motor to go from 1000 PWM to 2000 PWM. The ConditionCommands() is the routine that ramps it. Keeps it from body slamming itself on a spike.
 #define ALT_FREQ_HZ 100.0f           // Check altitude just 100 times per second.
-#define ESC_FREQ_HZ 400              // How frequent to send commands to the ESC
-#define ESC_RESOLUTION 14            // Bits to use for PWM pulses
-#define ESC_PERIOD_US 2500
-#define ESC_MAX_DUTY 16383           // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty.
-#define ESC_US_TO_DUTY 6.5536f       // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty.
+
+#define ESC_RESOLUTION 14            // Bits to use for PWM pulses. 14 is the max on the ESC-S3
+#define ESC_FREQ_HZ 400              // The full HZ tick width of each Simonk frame for PWM.
+#define ESC_PERIOD_US 2500           // Microseconds of 400HZ
+#define ESC_MAX_DUTY 16383           // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty. Change if you change ESC HZ
+#define ESC_US_TO_DUTY 6.5536f       // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty. Change if you change ESC HZ
 
 // Parameter Storage
 #include <Preferences.h>
@@ -80,7 +80,7 @@ static unsigned long failsafeTime = 0;
 static bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
 static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
 static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
-static float failsafeCoeff = 0.0006f;                               // 0.0001 - 0.03 (slow to fast)
+static float failsafeCoeff = 1.0f;                               // 0.0001 - 0.03 (slow to fast)
 
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.06f;
@@ -154,7 +154,7 @@ static unsigned long print_counter, serial_counter;
 static volatile unsigned long debugger;
 static bool flying = false;
 static bool playingSong = false;
-TaskHandle_t loopDroneHandle; // Handle for the main drone control loop task that will run on its own core.
+TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop task that will run on its own core.
 
 // Radio communication:
 static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_Failsafed;
@@ -167,28 +167,30 @@ static float GyroX, GyroY, GyroZ;
 static float GyroX_prev, GyroY_prev, GyroZ_prev;
 static float roll_IMU, pitch_IMU, yaw_IMU;
 static float roll_IMU_prev, pitch_IMU_prev;
-constexpr float G_PER_LSB = 1.0f / 1024.0f; // ±32 g
-constexpr float DPS_PER_LSB = 1.0f / 16.4f; // ±2000 dps
+static float K_pos2pwm = 50.0f;  // tune
+constexpr float G_PER_LSB = 1.0f / 2048.0f; // ACCEL_FS_SEL = 1, ±16 g, Page 11 of IMU-icm-40609-d_v1.2.pdf
+constexpr float DPS_PER_LSB = 1.0f / 32.8f; // GYRO_FS_SEL = 1, ±1000 dps, Page 10 of IMU-icm-40609-d_v1.2.pdf
 constexpr float USEC_TO_SEC = 1.0f / 1000000.0f;
 static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
 static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
 static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
-/* Big drone
+
+// GPS Flight Controller
 static float AccErrorX = 0.01;
 static float AccErrorY = -0.03;
 static float AccErrorZ = 0.01;
 static float GyroErrorX = 0.55;
 static float GyroErrorY = -0.85;
 static float GyroErrorZ = 0.63;
-*/
 
-// Little Drone
+/* No GPS Flight Controller
 static float AccErrorX = -0.01;
 static float AccErrorY = 0.02;
 static float AccErrorZ = -0.01;
 static float GyroErrorX = -1.02;
 static float GyroErrorY = 0.38;
 static float GyroErrorZ = 0.55;
+*/
 
 static SPIClass IMUSPI(HSPI);
 
@@ -214,11 +216,10 @@ static int batteryVoltage = 777;             // just a default for the battery m
 static unsigned long next_voltage_check = 0; // used in loopBuzzer to check for voltage on the main battery.
 static bool beeping = false;                 // For tracking beeping when the battery is getting low.
 static float calced_voltage = 14.8;
-TaskHandle_t buzzerTaskHandle;
 
 // WiFi Variables
 static WiFiServer server(80);
-TaskHandle_t wifiTaskHandle;
+
 // WiFi End
 
 //========================================================================================================================//
@@ -228,19 +229,19 @@ TaskHandle_t wifiTaskHandle;
 void setup()
 {
   // Bootup operations
+  loopDroneHandle = xTaskGetCurrentTaskHandle();
   setupSerial();             // Sets up both Serial and Serial1 for communication.
   setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
   setupMotorCommunication(); // Sets up ledc channels for motor control
-  beginBuzzerTask();         // Setup pin for reading the Battery
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   setupPeripherals();
-  beginWifiTask();
+  setupBatteryMonitor();     // Sets up the ADC to monitor battery voltage
+  setupWiFi();               // Sets up the WiFi access point and web server
   setupGPS();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
-  setupPressureSensor();
-  setupIMU();
+  setupPressureSensor();     // Gets some default info and ensures their is a working BMP581 on board
+  setupIMU();                // Ensures there is a working IMU on board - it's imperative.
   //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   Serial.println("Waiting for Radio");
-  delay(100);
   playStartSong();
   // motorTest(); //Used to check rotation on the bench. NO PROPS!
   if (!EASYCHAIR)
@@ -251,10 +252,24 @@ void setup()
 }
 
 void loop()
-{ // Not used since we are running tasks, but must remain for the Arduino IDE.
+{
+  //Serial.println("tick:");
+  tick();
+  syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
+  getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
+  getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  //Serial.println(micros()-tick_time);//331
+  getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
+  //Serial.println(micros()-tick_time);//377
+  PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
+  //Serial.println(micros()-tick_time);//395
+  motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
+  //Serial.println(micros()-tick_time);//412
+  tock();                                   // Yields until the end of the the inner loop pacing
+  troubleShooting();
 }
 
-void tick()
+inline void tick()
 {
   // Keep track of what time it is and how much time has elapsed since the last loop
   prev_time = tick_time;
@@ -262,21 +277,6 @@ void tick()
   deltaTime = (tick_time - prev_time) / 1000000.0; // Time since last tick. Division takes it from micros to seconds.  1000000 ms=1 second
 }
 
-void loopDrone(void *pvParameters)
-{
-  while (true)
-  {
-    tick();
-    syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict.
-    getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering.
-    getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 2kHz. IMU output. Is actually downsampled from 32kHz.
-    getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness.
-    PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle
-    motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle.
-    tock();                                   // Yields until the end of the 500uS pacing is met to sustain 2kHz
-    //troubleShooting();
-  }
-}
 
 // ========================================================================================================================//
 //                                                      FUNCTIONS                                                         //
@@ -292,11 +292,12 @@ void setupPeripherals()
 inline void syncAltitude()
 { // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
   // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
-  if (!altitudeData.hasBMP581) return;
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
   {
     altitudeData.altitude = altitudeData.altitudeWorking;
     altitudeData.rateFPS = altitudeData.rateFPSWorking;
+    gps.latitude = gps.latitudeWorking;
+    gps.longitude = gps.longitudeWorking;
   }
 }
 
@@ -305,7 +306,7 @@ void beginAltitudeTask()
   // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
   // on its own core.
   xTaskCreatePinnedToCore(
-      bmpTask,        // Task function
+      bmpAndgpsTask,               // Task function
       "BMP581 Task",               // Name
       4096,                        // Stack size (bytes)
       NULL,                        // Parameters
@@ -315,77 +316,25 @@ void beginAltitudeTask()
   );
 }
 
-void beginWifiTask()
-{
-  // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
-  // on its own core.
-  xTaskCreatePinnedToCore(
-    wifiTask,        // Task function
-    "Wifi Task",               // Name
-    4096,                        // Stack size (bytes)
-    NULL,                        // Parameters
-    3,                           // Priority (pressure)
-    &wifiTaskHandle, // Task handle
-    0                            // Core 0 since it is slower overall
-  );
-}
-
-void beginBuzzerTask()
-{
-  // Start task that handles communication with the buzzer.
-  xTaskCreatePinnedToCore(
-    buzzerTask,        // Task function
-    "Buzzer Task",               // Name
-    4096,                        // Stack size (bytes)
-    NULL,                        // Parameters
-    4,                           // Priority (lowest priority of pressure, wifi, buzzer)
-    &buzzerTaskHandle,            // Task handle
-    0                            // Core 0 since it is slower overall
-  );
-}
-
-void beginGPSTask()
-{
-  // Start task that handles communication with the buzzer.
-  xTaskCreatePinnedToCore(
-    gpsTask,        // Task function
-    "GPS Task",               // Name
-    4096,                        // Stack size (bytes)
-    NULL,                        // Parameters
-    2,                           // Priority (lowest priority of pressure, wifi, buzzer)
-    &gps.gpsTaskHandle,            // Task handle
-    0                            // Core 0 since it is slower overall
-  );
-}
-
-void gpsTask(void *pvParameters)
-{
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(1000); // 1 Hz
-
-  while (true)
-  {
-    // Do the sensor read
-    gps.latitude =  gps.Max10SGPS.getLatitude() / 1e7;
-    gps.longitude = gps.Max10SGPS.getLongitude() / 1e7;
-    gps.fixType = gps.Max10SGPS.getFixType();
-    if (homePos.valid && gps.hasGPS && gps.fixType >= 3) gps.useGPS = true;
-    else gps.useGPS = false;  
-    // Delay until the next absolute 200 ms boundary
-    vTaskDelayUntil(&lastWakeTime, period);
-  }
-}
-
-void bmpTask(void *pvParameters)
+void bmpAndgpsTask(void *pvParameters)
 {
   TickType_t lastWakeTime = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(10); // 100 Hz
+  int ticker=0;
 
   while (true)
   {
     // Do the sensor read
     getAltitude();
-
+    if (++ticker>10) // 1 Hz, get GPS data
+    {
+      ticker=0;
+      gps.latitudeWorking =  gps.Max10SGPS.getLatitude() / 1e7;
+      gps.longitudeWorking = gps.Max10SGPS.getLongitude() / 1e7;
+      gps.fixType = gps.Max10SGPS.getFixType();
+      if (homePos.valid && gps.hasGPS && gps.fixType >= 3) gps.useGPS = true;
+      else gps.useGPS = false; 
+    }
     // Delay until the next absolute 10 ms boundary
     vTaskDelayUntil(&lastWakeTime, period);
   }
@@ -423,35 +372,29 @@ inline void getAltitude()
 
 inline void setAltitudeRate()
 {
-    static long lastTime = micros();
+    static unsigned long lastTime = micros();
     static float lastAltitude = 0.0f;
-    static bool first = true;
+    static int rateCounter =0;
 
-    long currentTime = micros();
+    unsigned long currentTime = micros();
     float currentAltitude = altitudeData.altitudeWorking;
 
-    if (first)
+    if (++rateCounter > 50)
     {
-        // No prior sample yet
-        altitudeData.rateFPSWorking = 0.0f;
-        lastAltitude = currentAltitude;
-        lastTime = currentTime;
-        first = false;
-        return;
+      rateCounter=0;
+      float dt = (currentTime - lastTime) * 1e-6f;   // seconds
+      if (dt <= 0.0f)
+      {
+          altitudeData.rateFPSWorking = 0.0f;
+          return;
+      }
+
+      float dy = currentAltitude - lastAltitude;     // feet
+      altitudeData.rateFPSWorking = dy / dt;         // feet per second
+
+      lastAltitude = currentAltitude;
+      lastTime = currentTime;
     }
-
-    float dt = (currentTime - lastTime) * 1e-6f;   // seconds
-    if (dt <= 0.0f)
-    {
-        altitudeData.rateFPSWorking = 0.0f;
-        return;
-    }
-
-    float dy = currentAltitude - lastAltitude;     // feet
-    altitudeData.rateFPSWorking = dy / dt;         // feet per second
-
-    lastAltitude = currentAltitude;
-    lastTime = currentTime;
 }
 
 void setAltitude()
@@ -474,7 +417,7 @@ void setAltitude()
     ratio = fmaxf(ratio, 0.000001f);
     // Compute relative altitude in feet
     float newAltitude = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
-    altitudeData.altitudeWorking += 0.70f * (newAltitude - altitudeData.altitudeWorking);  //1.0 would make newAltitude be the current value, .1 would make the prior value hold the most weight
+    altitudeData.altitudeWorking += 0.40f * (newAltitude - altitudeData.altitudeWorking);  //1.0 would make newAltitude be the current value, .1 would make the prior value hold the most weight
   }
   else
   {
@@ -494,7 +437,7 @@ void troubleShooting()
   //  printRollPitchYaw();  // Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
   //  printPIDoutput();     // Prints computed stabilized PID variables from controller and desired setpoint (expected: ~ -1 to 1)
   //  printMotorCommands(); // Prints the values being written to the motors (expected: 1000 to 2000)
-  //  printtock();      // Prints the time between loops in microseconds (expected: microseconds between loop iterations and less the Gyro/Acc update speed.  Set by LOOP_TIMING)
+  //  printtock();      // Prints the time between loops in microseconds (expected: microseconds between inner loop iterations.  Set by DEFINES's)
   //  printGPS();
   #if EASYCHAIR
     printJSON();
@@ -605,7 +548,6 @@ void setupGPS()
   // Send raw UBX message
   gps.Max10SGPS.pushRawData(ubxTP5, sizeof(ubxTP5));
   delay(100);
-  beginGPSTask();
   Serial.println("UBX-CFG-TP5 sent: TIMEPULSE enabled at 1 Hz.");
 }
 
@@ -652,7 +594,9 @@ inline void controlMixer()
    * throttle_desired - direct throttle control
    * roll_PID, pitch_PID, yaw_PID - stabilized axis variables
    */
+  /* 
 
+  // Suppressing throttle compensation when tilted to gain computational speed 
   // Thrust increaser: increase thrust whenever a roll or pitch is desired
   float roll_rad = roll_des * DEG_TO_RAD;
   float pitch_rad = pitch_des * DEG_TO_RAD;
@@ -663,28 +607,16 @@ inline void controlMixer()
   // Compute thrust compensation factor
   float thrust_compensation = 1.0f / cos(tilt_angle_rad);
   thrust_compensation = constrain(thrust_compensation, 1.0f, 1.15f); // Prevent runaway
-
+  
   // Apply to throttle
   float throttle_corrected = throttle_desired * thrust_compensation;
+  */
 
   // Quad mixing
-  m1_command_scaled = throttle_corrected - pitch_PID + roll_PID + yaw_PID; // Front left
-  m2_command_scaled = throttle_corrected - pitch_PID - roll_PID - yaw_PID; // Front right
-  m3_command_scaled = throttle_corrected + pitch_PID - roll_PID + yaw_PID; // Back right
-  m4_command_scaled = throttle_corrected + pitch_PID + roll_PID - yaw_PID; // Back left
-
-  // ---Normalize if any motor > 1.0 --- This is assuming scaling down has the same thrust dynamics.
-  float max_val = fmaxf(fmaxf(m1_command_scaled, m2_command_scaled),
-                        fmaxf(m3_command_scaled, m4_command_scaled));
-
-  if (max_val > 1.0f)
-  {
-    float scale = 1.0f / max_val; // scaling factor
-    m1_command_scaled *= scale;
-    m2_command_scaled *= scale;
-    m3_command_scaled *= scale;
-    m4_command_scaled *= scale;
-  }
+  m1_command_scaled = throttle_desired - pitch_PID + roll_PID + yaw_PID; // Front left
+  m2_command_scaled = throttle_desired - pitch_PID - roll_PID - yaw_PID; // Front right
+  m3_command_scaled = throttle_desired + pitch_PID - roll_PID + yaw_PID; // Back right
+  m4_command_scaled = throttle_desired + pitch_PID + roll_PID - yaw_PID; // Back left
 
   // Constrain outputs (final safety clamp, although it should never be more than 1 since they are all scaled)
   m1_command_scaled = constrain(m1_command_scaled, 0.0f, 1.0f);
@@ -976,10 +908,10 @@ void setupIMU()
   delay(10); // <2ns SPI Slew Rate
   writeRegister(0x16, 0x00);
   delay(10); // Bypass FIFO (don't queue readings)
-  writeRegister(0x4F, 0x05);
-  delay(10); // Gyro 2000 dps at 2kHz updates downsampled from 32kHz
-  writeRegister(0x50, 0x05);
-  delay(10); // Accel 32g and 2Khz updates
+  writeRegister(0x4F, 0x26);
+  delay(10); // Gyro 1000 dps at 1kHz updates downsampled from 32kHz 00100110 = 0x26
+  writeRegister(0x50, 0x26);
+  delay(10); // Accel 16g and 1Khz updates 00100110 = 0x26
   writeRegister(0x65, 0x08);
   delay(10); // Don't bother interupting after reseet. Interrupt on 1 when data is available.
   writeRegister(0x76, 0x01);
@@ -1104,7 +1036,8 @@ inline void getIMUdata()
   // Timing
   unsigned long currentMicros = micros();
   unsigned long tempMicros = (currentMicros - lastMadgwickUpdateMicros);
-  if (tempMicros>=0 && tempMicros<1000) madDeltaTime = tempMicros * USEC_TO_SEC; else madDeltaTime=0.0005f;
+  //if (tempMicros>=0 && tempMicros<1000) madDeltaTime = tempMicros * USEC_TO_SEC; else madDeltaTime=0.0005f;
+  madDeltaTime = tempMicros * USEC_TO_SEC; 
   lastMadgwickUpdateMicros = currentMicros;
 
   // Madgwick update
@@ -1203,11 +1136,11 @@ inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float
   float twoq0q3 = 2.0f * (q0 * q3);
   float twoq1q2 = 2.0f * (q1 * q2);
 
-  roll_IMU = atan2f(twoq0q1 + twoq2q3, 1.0f - 2.0f * (q1q1 + q2q2)) * RAD2DEG;
-  pitch_IMU = -asinf(twoq0q2 - twoq1q3) * RAD2DEG; // flip pitch axis to match NASA
-  yaw_IMU = -atan2f(twoq0q3 + twoq1q2, 1.0f - 2.0f * (q2q2 + q3q3)) * RAD2DEG; // flip yaw axis to match NASA
+  roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
+  pitch_IMU = -asin(-2.0f * (q1*q3 - q0*q2))*57.29577951; //degrees
+  yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
 }
-
+/*
 void calculateIMUError()
 {
   Serial.println("Calculating IMU Error with 30000 filtered iterations. Please stand by...");
@@ -1314,7 +1247,7 @@ void calculateIMUError()
   Serial.println("Paste these values in user specified variables section and comment out calculateIMUError() in void setup.");
   halt();
 }
-
+*/
 inline void getDesiredAnglesAndThrottleScaledToOne()
 {
   // DESCRIPTION: Normalizes desired control values to appropriate values
@@ -1337,7 +1270,7 @@ inline void getDesiredAnglesAndThrottleScaledToOne()
   yaw_des = constrain(yaw_des, -1.0f, 1.0f) * maxYaw;         // Between -maxYaw and +maxYaw
 }
 
-void resetAllTiming()
+inline void resetAllTiming()
 {
   // Once flicked back into flight mode, this will set all frequencies to the same start light just incase there was drift.
   resetTimers = false;
@@ -1450,7 +1383,7 @@ inline void getRadioStickValues()
   PWM_pitch = getRadioPWM(pitchPin, 1500);
   PWM_yaw = getRadioPWM(yawPin, 1500);
   PWM_ThrottleCutSwitch = getRadioPWM(SwitchA, 2000);
-  PWM_Failsafed = getRadioPWM(SwitchB, 1500);
+  PWM_Failsafed = getRadioPWM(SwitchB, 1000);
   
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
   // Also, only allow killMotors if flying to prevent a ground accident when worm burning.
@@ -1463,7 +1396,7 @@ inline void getRadioStickValues()
         {
           landingTime = millis();
           landing = true;
-          gpsData.atHome = false; // reset atHome flag to false to ensure heading home.
+          gps.atHome = false; // reset atHome flag to false to ensure heading home.
         }
         unsigned long currentTime = millis();
 
@@ -1481,7 +1414,7 @@ inline void getRadioStickValues()
             { 
                 throttleOverrideCounter = 0;
                 float landingRate = altitudeData.targetRateLanding;
-                if (gpsData.useGPS && !gpsData.atHome && altitudeData.altitude < 12.0f)
+                if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
                 {
                     landingRate = 0.0f;
                 }
@@ -1545,43 +1478,66 @@ inline void getRadioStickValues()
 
 inline void headHome()
 {
-  // ---------------- HORIZONTAL RTL ----------------
-  if (gps.useGPS)
-  {
-    float errN, errE;
-    gpsData.useGPS = true;
-    gpsErrorToNE(gpsData.latitude, gpsData.longitude,
-                 homePos.lat_deg, homePos.lon_deg,
-                 errN, errE);
-
-    float dist2 = errN*errN + errE*errE;
-
-    if (dist2 > 1.0f)   // more than ~1 m away
+    // ---------------- HORIZONTAL RTL ----------------
+    if (gps.useGPS)
     {
-        // Convert position error → stick PWM
-        const float K_pos2pwm = 50.0f;  // tune
+        float errN, errE;
 
-        float pitchOffset = -K_pos2pwm * errN;  // north = pitch forward
-        float rollOffset  =  K_pos2pwm * errE;  // east = roll right
+        gpsErrorToNE(gps.latitude, gps.longitude,
+                     homePos.lat_deg, homePos.lon_deg,
+                     errN, errE);
 
-        float pitchCmd = 1500.0f + pitchOffset;
-        float rollCmd  = 1500.0f + rollOffset;
+        float dist2 = errN*errN + errE*errE;
 
-        pitchCmd = constrain(pitchCmd, 1300.0f, 1700.0f);
-        rollCmd  = constrain(rollCmd, 1300.0f, 1700.0f);
-        gpsData.atHome = false;
-        PWM_pitch = pitchCmd;
-        PWM_roll  = rollCmd;
+        if (dist2 > 1.0f)   // more than ~1 m away
+        {
+            // --- Rotate world-frame error into body-frame using yaw ---
+            // yaw from Madgwick (radians)
+            float psi = -yaw_IMU * 0.01745329252f;
+
+            float c = cosf(psi);
+            float s = sinf(psi);
+
+            // Body-frame forward/right errors
+            float e_forward =  c * errN + s * errE;   // +forward means home is ahead
+            float e_right   = -s * errN + c * errE;   // +right means home is to the right
+
+            // Convert body-frame error → stick PWM
+            float pitchOffset = -K_pos2pwm * e_forward;  // forward error → pitch forward
+            float rollOffset  =  K_pos2pwm * e_right;    // right error → roll right
+
+            float pitchCmd = 1500.0f + pitchOffset;
+            float rollCmd  = 1500.0f + rollOffset;
+
+            pitchCmd = constrain(pitchCmd, 1300.0f, 1700.0f);
+            rollCmd  = constrain(rollCmd, 1300.0f, 1700.0f);
+
+            gps.atHome = false;
+            PWM_pitch = pitchCmd;
+            PWM_roll  = rollCmd;
+        }
+        else
+        {
+            // Close enough to home → level out
+            PWM_pitch = 1500;
+            PWM_roll  = 1500;
+            gps.atHome = true;
+        }
     }
-    else
-    {
-        // Close enough to home → level out
-        PWM_pitch = 1500;
-        PWM_roll  = 1500;
-        gpsData.atHome = true;
-    }
-  }
-// ------------------------------------------------
+}
+
+void gpsErrorToNE(double lat_now, double lon_now,
+                         double lat_home, double lon_home,
+                         float &errN_m, float &errE_m)
+{
+    const double deg2rad = 0.017453292519943295;
+    double dLat = (lat_home - lat_now) * deg2rad;
+    double dLon = (lon_home - lon_now) * deg2rad;
+    double latRad = lat_now * deg2rad;
+
+    double R = 6378137.0; // Earth radius
+    errN_m = (float)(R * dLat);
+    errE_m = (float)(R * cos(latRad) * dLon);
 }
 
 inline void setToFailsafe()
@@ -1651,14 +1607,14 @@ inline void scaleMotorCommandsToPWM()
   m3_command_PWM = throttleLimit * m3_command_scaled * 1000 + 1000;
   m4_command_PWM = throttleLimit * m4_command_scaled * 1000 + 1000;
 }
-
+/*
 inline void calibrateESCs()
 {
   // DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
   // If the Throttle kill switch is in the up position, then skip calibration. To calibrate, turn on the
   // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  It takes around 8 seconds.
   return; //only do without props
-  /*
+  
   Serial.println("Calibrating ESCs...");
   ESCWriteMicroseconds(m1Pin, 2000);
   ESCWriteMicroseconds(m2Pin, 2000);
@@ -1672,9 +1628,9 @@ inline void calibrateESCs()
   delay(1000);
   Serial.println("Calibration complete.");
   while (true) delay(10); // stall out to encourage commenting this back out after calibration - written in blood approach.
-  */
+  
 }
-
+*/
 void throttleCut()
 {
   // DESCRIPTION: Directly set actuator outputs to minimum value if triggered
@@ -1758,28 +1714,14 @@ void throttleCut()
 
 void setHome()
 {
-  if (gpsData.hasGPS && gpsData.fixType >= 3)
+  if (gps.hasGPS && gps.fixType >= 3)
   {
-      homePos.lat_deg = gpsData.latitude;
-      homePos.lon_deg = gpsData.longitude;
+      homePos.lat_deg = gps.latitude;
+      homePos.lon_deg = gps.longitude;
       homePos.valid = true;
   } else {
       homePos.valid = false;
   }
-}
-
-inline void gpsErrorToNE(double lat_now, double lon_now,
-                         double lat_home, double lon_home,
-                         float &errN_m, float &errE_m)
-{
-    const double deg2rad = 0.017453292519943295;
-    double dLat = (lat_home - lat_now) * deg2rad;
-    double dLon = (lon_home - lon_now) * deg2rad;
-    double latRad = lat_now * deg2rad;
-
-    double R = 6378137.0; // Earth radius
-    errN_m = (float)(R * dLat);
-    errE_m = (float)(R * cos(latRad) * dLon);
 }
 
 void killMotors()
@@ -1808,9 +1750,13 @@ void tock()
    * about every few seconds, it gets overran, but I don't know why yet on the ESP32-S3.
    */
   // Sit in loop until appropriate time has passed while checking for any WiFi client activity.
-
   while ((unsigned long)(micros() - tick_time) < innerLoopMicroseconds)
   {
+    if (throttle_is_cut)
+    {
+      loopBuzzer();                             // Monitors battery voltage and beeps if low. Lowest priority task.
+      loopWiFi();
+    }
     taskYIELD();
   };
 
@@ -1888,9 +1834,9 @@ void printAltitude()
   {
     print_counter = micros();
     Serial.print(F("Altitude: "));
-    Serial.print(altitudeData.altitude,1);
+    Serial.print(altitudeData.altitude,4);
     Serial.print(F("  Altitude Rate: "));
-    Serial.print(altitudeData.rateFPS,1);
+    Serial.print(altitudeData.rateFPS,4);
     Serial.print(F("  Delta Time:"));
     Serial.println(deltaTime * 1000000.0);
   }
@@ -1985,7 +1931,7 @@ void printJSON()
     Serial.print(debugger);
 
     Serial.print(F(", \"DeltaTime\": "));
-    Serial.print(deltaTime * 1000000.0);
+    Serial.print(madDeltaTime* 1000000.0);
     Serial.println("}");
   }
 }
@@ -2039,8 +1985,11 @@ void printtock()
   if (tick_time - print_counter > 50000)
   {
     print_counter = micros();
-    Serial.print(F("deltaTime = "));
+    Serial.print(F("inner microseconds = "));
+    Serial.print(innerLoopMicroseconds);
+    Serial.print(F("   deltaTime = "));
     Serial.println(deltaTime * 1000000.0);
+    
   }
 }
 
@@ -2109,28 +2058,6 @@ void beginDroneLoopTask()
   );
 }
 
-void wifiTask(void *pvParameters)
-{
-  setupWiFi();
-  vTaskDelay(100);
-  while (true)
-  {
-    // Do the sensor read
-    if (throttle_is_cut) loopWiFi();
-    vTaskDelay(250);
-  }
-}
-void buzzerTask(void *pvParameters)
-{
-  setupBatteryMonitor();
-  vTaskDelay(100);
-  while (true)
-  {
-    // Do the sensor read
-    loopBuzzer();
-    vTaskDelay(100);
-  }
-}
 void setupWiFi()
 {
   const char *ssid = "_Rawpter";
@@ -2258,9 +2185,9 @@ void loopWiFi()
   // --- Default page (redirect everything else) ---
   else
   {
-    Serial.println("Generating the page...");
+    if (EASYCHAIR) Serial.println("Generating the page...");
     GenerateDefaultPage(client);
-    Serial.println("Served the page.");
+    if (EASYCHAIR) Serial.println("Served the page.");
   }
 
   client.stop();
@@ -2273,10 +2200,10 @@ void setValuesFromUserForm(String req)
 
   int qIndex = req.indexOf('?');
   int hIndex = req.indexOf("HTTP");
-  Serial.print("qIndex: ");
-  Serial.println(String(qIndex));
-  Serial.print(" hIndex: ");
-  Serial.println(String(hIndex));
+  if (EASYCHAIR) Serial.print("qIndex: ");
+  if (EASYCHAIR) Serial.println(String(qIndex));
+  if (EASYCHAIR) Serial.print(" hIndex: ");
+  if (EASYCHAIR) Serial.println(String(hIndex));
   if (qIndex == -1 || hIndex == -1)
     return;
 
@@ -2355,6 +2282,8 @@ void setValuesFromUserForm(String req)
       pitchLimits.maxRate = value.toFloat();
     else if (key =="maxYaw")
       maxYaw = value.toFloat();
+    else if (key =="K_pos2pwm")
+      K_pos2pwm = value.toFloat();
     else if (key == "failsafeThrottlePWM")
       failsafeThrottlePWM = value.toInt();
     else if (key == "kp_altitude_rate") altitudeData.kp_altitude_rate = value.toFloat();
@@ -2381,7 +2310,7 @@ void setValuesFromUserForm(String req)
     else if (key == "failsafeCoeff")
     {
       failsafeCoeff = value.toFloat();
-      failsafeCoeff = constrain(failsafeCoeff, 0.00001, .03);
+      failsafeCoeff = constrain(failsafeCoeff, 0.00001, 1.0);
     }
     else if (key == "DOWN_COEFF")
     {
@@ -2455,7 +2384,7 @@ void saveParameters()
   throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
   UP_COEFF = constrain(UP_COEFF,0.0,1.0); //protect from a fat finger
   DOWN_COEFF = constrain(DOWN_COEFF,0.0,1.0); //protect from a fat finger
-  failsafeCoeff = constrain(failsafeCoeff, 0.00001, 0.03);
+  failsafeCoeff = constrain(failsafeCoeff, 0.00001,1.0);
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
   prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
   prefs.putFloat("ceiling", altitudeData.ceiling);
@@ -2491,11 +2420,12 @@ void saveParameters()
   prefs.putFloat("maxRoll",maxRoll);
   prefs.putFloat("maxPitch",maxPitch);
   prefs.putFloat("maxYaw",maxYaw);
+  prefs.putFloat("K_pos2pwm", K_pos2pwm);
   prefs.putFloat("Kp_yaw_rate", Kp_yaw_rate);
   prefs.putFloat("Ki_yaw_rate", Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", Kd_yaw_rate);
   prefs.end(); // close namespace
-  //Serial.println("Free entries: " + String(prefs.freeEntries()));
+  if (EASYCHAIR) Serial.println("Free entries: " + String(prefs.freeEntries()));
 }
 
 void loadParameters()
@@ -2542,18 +2472,18 @@ void loadParameters()
   maxRoll = constrain(maxRoll,5,70);
   maxPitch = constrain(maxPitch, 5, 70);
   maxYaw = prefs.getFloat("maxYaw", maxYaw);
-
+  K_pos2pwm = prefs.getFloat("K_pos2pwm", K_pos2pwm);
   Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", Kp_yaw_rate);
   Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", Ki_yaw_rate);
   Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", Kd_yaw_rate);
 
   prefs.end();
-  //Serial.println("Parameters loaded from NVS (or defaults if none stored).");
+  if (EASYCHAIR) Serial.println("Parameters loaded from NVS (or defaults if none stored).");
 }
 
 void GenerateDefaultPage(WiFiClient &client) 
 { 
-  //Serial.println("About to MakeWebPage.");
+  if (EASYCHAIR) Serial.println("About to MakeWebPage.");
   // Build HTML body first (so we can compute Content-Length)
   String body; 
   body.reserve(8192); 
@@ -2629,7 +2559,8 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<td>Roll (max angle):</td><td><input name=maxRoll style='width:90px;' type=number value='" + String(maxRoll) + "'></td></tr>";
   body += "<tr><td>Pitch Rate (deg/s):</td><td><input name=pitch_maxRate style='width:90px;' type=number value='" + String(pitchLimits.maxRate) + "'></td>";
   body += "<td>Pitch (max angle):</td><td><input name=maxPitch style='width:90px;' type=number value='" + String(maxPitch) + "'></td></tr>";
-  body += "<tr><td>Yaw Rate (deg/s):</td><td><input name=maxYaw style='width:90px;' type=number value='" + String(maxYaw) + "'></td></tr>";
+  body += "<tr><td>Yaw Rate (deg/s):</td><td><input name=maxYaw style='width:90px;' type=number value='" + String(maxYaw) + "'></td>";
+  body += "<td>Home Pitch Gain (K_pos2pwm):</td><td><input name=K_pos2pwm style='width:90px;' step=.1 type=number value='" + String(K_pos2pwm,1) + "'></td></tr>";
   body += "</table>";
   body += "<br>Tip: Before powering down, Save to Storage - but if just experimenting during the session hold off saving to extend the Flash Storage life.<br>";
   // Additional parameters table 
@@ -2681,7 +2612,7 @@ void GenerateDefaultPage(WiFiClient &client)
   // Send headers + body in one go 
   client.write((const uint8_t *)headers.c_str(), headers.length());
   client.write((const uint8_t *)body.c_str(), body.length());  
-  //Serial.println("Made Web Page.");
+  if (EASYCHAIR) Serial.println("Made Web Page.");
 }
 
 /*
@@ -2701,5 +2632,4 @@ void motorTest()
     ESCWriteMicroseconds(m4Pin, 1100);
     delay(2000);
   }
-}
 */
