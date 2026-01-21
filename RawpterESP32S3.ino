@@ -2065,18 +2065,15 @@ void loopWiFi()
       return;
   }
 
-  Serial.println("Got Wifi Client.");
   // Read request line
   String req = client.readStringUntil('\r');
   if (client.available()) client.readStringUntil('\n'); // consume newline
-  Serial.println("Request: " + req);
-
+  
   // --- iOS captive portal probe ---
   if (req.startsWith("GET /hotspot-detect.html"))
   {
     const char *body = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
     int len = strlen(body);
-    Serial.println("Serving iOS.");
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html");
     client.println("Connection: close");
@@ -2084,7 +2081,6 @@ void loopWiFi()
     client.println(len);
     client.println();
     client.print(body);
-    Serial.println("Served iOS.");
   }
   // --- Android captive portal probe ---
   else if (req.startsWith("GET /generate_204"))
@@ -2097,8 +2093,6 @@ void loopWiFi()
   }
   else if (req.startsWith("CONNECT "))
   {
-    Serial.println("Handling CONNECT request: " + req);
-
     // Minimal response: tell the client the tunnel is "established"
     client.println("HTTP/1.1 200 Connection Established");
     client.println("Connection: close");
@@ -2114,7 +2108,6 @@ void loopWiFi()
   }
   else if (req.startsWith("GET /apple-touch-icon"))
   {
-    Serial.println("Ignoring iOS touch icon request.");
     client.println("HTTP/1.1 204 No Content");
     client.println("Connection: close");
     client.println();
