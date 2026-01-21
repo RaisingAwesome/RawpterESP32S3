@@ -24,9 +24,7 @@ void RmtPPMReader::begin(uint8_t pin, uint32_t rmtFreqHz, uint16_t pulses, uint1
   rmtSetRxMaxThreshold(gpio, threshold);
 
   // Create the read task
-  if (xTaskCreate(readTask, "RmtPPMReader", 4096, this, 4, NULL) != pdPASS) {
-    Serial.println("Failed to create RmtPPMReader readTask");
-  }
+  xTaskCreatePinnedToCore( readTask, "RmtPPMReader", 4096, this, 4, 0);
   vTaskDelay(200); // Give time to sync with radio;
 }
 
@@ -46,7 +44,7 @@ void RmtPPMReader::readTask(void *args) {
     if ((int)me->rx_num_symbols != me->pulseCount + 1) {
       // Let the next pass sync to the frame boundary via threshold stop.
       me->rx_num_symbols = me->pulseCount + 1; // reset desired read count
-      Serial.println("Syncing RMT to PPM...");
+      //Serial.println("Syncing RMT to PPM...");
       // Write zeros to inactive buffer and publish, so readers get a safe state.
       uint8_t inact = me->inactiveIndex();
       for (size_t i = 0; i < (size_t)me->pulseCount; i++) {
