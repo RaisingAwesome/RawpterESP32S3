@@ -1357,7 +1357,7 @@ inline void getRadioStickValues()
   static int throttleOverrideCounter = 0;
   static bool landing = false;
   static float integralAltitudeRate = 0 ;
-  static unsigned long landingTime = 0;
+  static unsigned long landingTicks = 0;
 
   // Read radio PWM
   PWM_throttle = getRadioPWM(throttlePin, 1000);
@@ -1376,13 +1376,15 @@ inline void getRadioStickValues()
     {   
         if (!landing)
         {
-          landingTime = millis();
+          landingTicks = 0.0f;
+          integralAltitudeRate = 0.0f; // reset integrator on landing start
+          throttleOverrideCounter = 0;
           landing = true;
           gps.atHome = false; // reset atHome flag to false to ensure heading home.
         }
-        unsigned long currentTime = millis();
+        
 
-        if (currentTime - landingTime > 5000 || altitudeData.altitude < 1.5f) 
+        if (landingTicks++ > 5000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
         {
           killMotors(); // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
           landing=false;
@@ -1393,7 +1395,7 @@ inline void getRadioStickValues()
             headHome(); // this will override pitch and roll PWM to head home if a GPS exists.
             
             if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ)
-            { 
+            {
                 throttleOverrideCounter = 0;
                 float landingRate = altitudeData.targetRateLanding;
                 if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
@@ -1401,13 +1403,16 @@ inline void getRadioStickValues()
                     landingRate = 0.0f;
                 }
                 float rateError  = landingRate - altitudeData.rateFPS;
-
+                if (rateError > 0.0f && integralAltitudeRate < 0.0f)
+                {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
+                    integralAltitudeRate = 0.0f;
+                }
                 // Integrator
                 integralAltitudeRate += rateError * 0.01f;  // 100 Hz is ticks at .01 seconds
 
                 // Don't accululate beyond PWM limits so you don't over saturate the integral.
                 float lowend  = -(altitudeData.sessionHoverPWM-1500) / altitudeData.ki_altitude_rate;
-                float highend =  (2000 - altitudeData.sessionHoverPWM) / (altitudeData.upGain * altitudeData.ki_altitude_rate);
+                float highend =  (2000 - altitudeData.sessionHoverPWM) / (altitudeData.ki_altitude_rate);
                 integralAltitudeRate = constrain(integralAltitudeRate, lowend, highend);
 
                 // Asymmetric gain: more aggressive when descent is too fast (rateError > 0)
@@ -1418,7 +1423,6 @@ inline void getRadioStickValues()
                           + altitudeData.ki_altitude_rate * integralAltitudeRate;
 
                 PWM_throttle = constrain(pwm, 1500, 2000);
-                if (PWM_throttle <= 1500) killMotors();
             }
             else
             {

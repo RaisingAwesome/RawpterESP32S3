@@ -15,16 +15,27 @@ void RmtPPMReader::begin(uint8_t pin, uint32_t rmtFreqHz, uint16_t pulses, uint1
   pulseCount = (pulses <= MAX_CHANNELS) ? pulses : MAX_CHANNELS;
 
   // RMT init (RX mode assumed constant)
-  if (!rmtInit(gpio, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_1, /*Hz*/ 1000000)) {
+  if (!rmtInit(gpio, RMT_RX_MODE, RMT_MEM_NUM_BLOCKS_1, /*Hz*/ rmtFreqHz)) {
     Serial.println("init receiver failed");
     while (true) vTaskDelay(10);
   }
 
   // Set sync gap max threshold (empirically: 2100 us is safe for FlySky-style PPM)
-  rmtSetRxMaxThreshold(gpio, threshold);
+  uint32_t ticks = (threshold * rmtFreqHz) / 1000000;
+  rmtSetRxMaxThreshold(gpio, ticks);
 
   // Create the read task
-  xTaskCreatePinnedToCore( readTask, "RmtPPMReader", 4096, this, 4, 0);
+
+  xTaskCreatePinnedToCore(
+    readTask,
+    "RmtPPMReader",
+    4096,
+    this,
+    4,
+    &rmtHandle, 
+    0
+  );
+
   vTaskDelay(200); // Give time to sync with radio;
 }
 
