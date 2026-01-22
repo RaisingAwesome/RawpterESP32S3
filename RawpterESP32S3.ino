@@ -71,7 +71,7 @@ static int16_t PWM_roll_fs = 1500;              // it quits turning
 static int16_t PWM_pitch_fs = 1500;             // elev
 static int16_t PWM_yaw_fs = 1500;               // rudd
 static int16_t PWM_ThrottleCutSwitch_fs = 2000; // SWA less than 1300, cut throttle, but we don't want to cut throttle, just allow it to decrease so it lands. - must config a switch to Channel 5 in your remote.
-static int16_t PWM_FailSafed_fs = 1500;         // Used to flag that the receiver had to go to failsafe
+static int16_t PWM_FailsafeSwitch_fs = 1000;    // Used to flag that the receiver had to go to failsafe
 static float stick_dampener = 1.0f;             // 0.1-1 Lower=slower, higher=noiser default 0.7
 static float throttleLimit = 0.6f;              // can be overridden with web interface.
 static bool failsafed = false;
@@ -80,7 +80,7 @@ static unsigned long failsafeTime = 0;
 static bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
 static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
 static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
-static float failsafeCoeff = 1.0f;                               // 0.0001 - 0.03 (slow to fast)
+static float failsafeCoeff = .00001f;                               // 0.0001 - 0.03 (slow to fast)
 
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.02f;
@@ -145,7 +145,6 @@ HomePosition homePos{};
 AltitudeData altitudeData{};
 
 // General stuff for controlling timing of things
-static float deltaTime = 0.0f;
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
 static bool resetTimers = false;
 static unsigned long tick_time, prev_time;
@@ -157,7 +156,7 @@ TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop t
 static bool rateControlMode = false;
 
 // Radio communication:
-static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_Failsafed;
+static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
 static int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
 
 // IMU:
@@ -215,7 +214,7 @@ static int batteryVoltage = 777;             // just a default for the battery m
 static unsigned long next_voltage_check = 0; // used in loopBuzzer to check for voltage on the main battery.
 static bool beeping = false;                 // For tracking beeping when the battery is getting low.
 static float calced_voltage = 14.8;
-//static unsigned long start_time;
+// static unsigned long start_time;
 // WiFi Variables
 static WiFiServer server(80);
 
@@ -280,7 +279,6 @@ inline void tick()
   // Keep track of what time it is and how much time has elapsed since the last loop
   prev_time = tick_time;
   tick_time = micros();
-  deltaTime = (tick_time - prev_time) / 1000000.0; // Time since last tick. Division takes it from micros to seconds.  1000000 ms=1 second
 }
 
 // ========================================================================================================================//
@@ -688,14 +686,14 @@ void waitForRadio()
   // Using PWM_throttle_prev so that it is seeded
   PWM_throttle_prev = getRadioPWM(throttlePin, 1520);
   PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
-  PWM_Failsafed = getRadioPWM(SwitchB, 1000);
+  PWM_FailsafeSwitch = getRadioPWM(failsafePin, 1000);
 
-  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1519 || PWM_ThrottleCutSwitch > 1500 || PWM_Failsafed < 1500) && !EASYCHAIR)
+  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1519 || PWM_ThrottleCutSwitch > 1500 || PWM_FailsafeSwitch < 1500) && !EASYCHAIR)
   { // Throttle Cut switch pulled down (flymode) is 2000. Up is 1000 (cut)
     // if the throttle is up or the cut switch is set to Fly (pulled down), then wait until the switches are set.
     PWM_throttle_prev = getRadioPWM(throttlePin, 1520);              // keep it stuck in the loop if it failsafes
     PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
-    PWM_Failsafed = getRadioPWM(failsafePin, 1000);
+    PWM_FailsafeSwitch = getRadioPWM(failsafePin, 1000);
     tick();
     getIMUdata();
     loopWiFi();
@@ -725,14 +723,16 @@ void setupMotorCommunication()
 
   //calibrateESCs(); //ONLY ENABLE WITHOUT PROPS!!!!!!!!!! This is written in blood!
 
-  m1_command_PWM = 1000; // Will send the default for motor stopped for Simonk firmware
+  m1_command_PWM = 1000; // Will send the default for motor stopped for Simonk firmware once the radio is detected later in the setup()
   m2_command_PWM = 1000;
   m3_command_PWM = 1000;
   m4_command_PWM = 1000;
 
   // Just in case, make sure the variables that hold radio values are safe.
-  setToFailsafe();
-  PWM_throttle = PWM_throttle_zero; // zero may not necessarily be the failsafe, but on startup we want zero.
+  PWM_throttle = PWM_throttle_zero;
+  PWM_roll = PWM_roll_fs;
+  PWM_pitch = PWM_pitch_fs;
+  PWM_yaw = PWM_yaw_fs;
 }
 
 inline void ESCWriteMicroseconds(int gpio, int us)
@@ -812,7 +812,7 @@ inline void loopBuzzer()
   static unsigned long buzzer_spacing = 30000;
   unsigned long myTime = millis();
   if (playingSong) return;
-  if (PWM_Failsafed < 1500)
+  if (PWM_FailsafeSwitch < 1500)
     buzzer_spacing = 100;
   else 
     buzzer_spacing = 30000;
@@ -1018,7 +1018,7 @@ inline void getIMUdata()
   unsigned long currentMicros = micros();
   unsigned long tempMicros = (currentMicros - lastMadgwickUpdateMicros);
   //if (tempMicros>=0 && tempMicros<1000) madDeltaTime = tempMicros * USEC_TO_SEC; else madDeltaTime=0.0005f;
-  madDeltaTime = tempMicros * USEC_TO_SEC; 
+  madDeltaTime = tempMicros * USEC_TO_SEC;
   lastMadgwickUpdateMicros = currentMicros;
 
   // Madgwick update
@@ -1034,7 +1034,7 @@ inline void getIMUdata()
   // So, to map it to the IMU's physical installation in the frame, for a Z now being roll up when compared to NED,
   // and X pointing backwards, Y will be positive in the oppositve direction. Based on how the board is installed, 
   // X is actually pointing to the back of the drone, so its AccX needs flipped. Thus, you call Madgwick like this:
-  Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ);
+  Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
 }
 
 void setupPPM()
@@ -1042,7 +1042,7 @@ void setupPPM()
   radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
 }
 
-inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az)
+inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, unsigned long dt)
 {
   // Precomputed constants
   constexpr float DEG2RAD = 0.01745329252f; // π/180
@@ -1096,10 +1096,10 @@ inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float
   }
 
   // Integrate quaternion
-  q0 += qDot1 * madDeltaTime;
-  q1 += qDot2 * madDeltaTime;
-  q2 += qDot3 * madDeltaTime;
-  q3 += qDot4 * madDeltaTime;
+  q0 += qDot1 * dt;
+  q1 += qDot2 * dt;
+  q2 += qDot3 * dt;
+  q3 += qDot4 * dt;
 
   // Normalize quaternion
   float norm = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
@@ -1364,15 +1364,15 @@ inline void getRadioStickValues()
   PWM_roll = getRadioPWM(rollPin, 1500);
   PWM_pitch = getRadioPWM(pitchPin, 1500);
   PWM_yaw = getRadioPWM(yawPin, 1500);
-  PWM_ThrottleCutSwitch = getRadioPWM(SwitchA, 2000);
-  PWM_Failsafed = getRadioPWM(SwitchB, 1000);
+  PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
+  PWM_FailsafeSwitch = getRadioPWM(SwitchB, 1000);
   
   // Radio Receiver or Switch B is in Failsafe Mode - Land safely
   // Also, only allow killMotors if flying to prevent a ground accident when worm burning.
   
   if (altitudeData.hasBMP581) 
   {
-    if (PWM_Failsafed < 1900 /*landing*/ && flying)
+    if (PWM_FailsafeSwitch < 1900 /*landing*/ && flying)
     {   
         if (!landing)
         {
@@ -1394,7 +1394,7 @@ inline void getRadioStickValues()
         {
             headHome(); // this will override pitch and roll PWM to head home if a GPS exists.
             
-            if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ)
+            if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
             {
                 throttleOverrideCounter = 0;
                 float landingRate = altitudeData.targetRateLanding;
@@ -1403,8 +1403,12 @@ inline void getRadioStickValues()
                     landingRate = 0.0f;
                 }
                 float rateError  = landingRate - altitudeData.rateFPS;
-                if (rateError > 0.0f && integralAltitudeRate < 0.0f)
+                if (rateError > 0.5f && integralAltitudeRate < 0.0f)
                 {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
+                    integralAltitudeRate = 0.0f;
+                }
+                else if (rateError < 1.0f && integralAltitudeRate > 0.0f)
+                {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
                     integralAltitudeRate = 0.0f;
                 }
                 // Integrator
@@ -1438,7 +1442,7 @@ inline void getRadioStickValues()
   }
   else
   { // No altitude data, so just set throttle to minimum to prevent flyaways.
-    if (PWM_Failsafed < 1900) PWM_throttle = 1500; 
+    if (PWM_FailsafeSwitch < 1900) PWM_throttle = 1500; 
   }
 
   if (PWM_throttle > highestThrottlePWM)
@@ -1448,7 +1452,7 @@ inline void getRadioStickValues()
 
   // Smoothing
   float coeff = (PWM_throttle > PWM_throttle_prev) ? UP_COEFF : DOWN_COEFF;
-  if (PWM_Failsafed < 1900) 
+  if (PWM_FailsafeSwitch < 1900) 
   {
     if (altitudeData.hasBMP581) 
       coeff = 1.0f;
@@ -1550,6 +1554,7 @@ inline void setToFailsafe()
   PWM_pitch = PWM_pitch_fs;
   PWM_yaw = PWM_yaw_fs;
   PWM_ThrottleCutSwitch = PWM_ThrottleCutSwitch_fs;
+  PWM_FailsafeSwitch = PWM_FailsafeSwitch_fs;
 }
 
 inline void motorPipeline()
@@ -1639,7 +1644,7 @@ void throttleCut()
       // reset (uncut throttle) only if throttle is down to prevent a jolting suprise
       if (PWM_throttle < 1520 && ++throttleNotCutCounter > 10)
       { // The radio is ready for flight and confirmed not to be just a blip.
-        if (PWM_Failsafed < 1900)
+        if (PWM_FailsafeSwitch < 1900)
         {
           playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
           throttleNotCutCounter = 0;
@@ -1828,7 +1833,7 @@ void printAltitude()
     Serial.print(F("  Altitude Rate: "));
     Serial.print(altitudeData.rateFPS,4);
     Serial.print(F("  Delta Time:"));
-    Serial.println(deltaTime * 1000000.0);
+    Serial.println(madDeltaTime * 1000000.0);
   }
 }
 
@@ -1911,8 +1916,8 @@ void printJSON()
     Serial.print(PWM_yaw);
     Serial.print(F(", \"PWM_ThrottleCutSwitch\": "));
     Serial.print(PWM_ThrottleCutSwitch);
-    Serial.print(F(", \"PWM_Failsafed\": "));
-    Serial.print(PWM_Failsafed);
+    Serial.print(F(", \"PWM_FailsafeSwitch\": "));
+    Serial.print(PWM_FailsafeSwitch);
     
     Serial.print(F(", \"Throttle_is_Cut\": "));
     Serial.print(throttle_is_cut);
@@ -1921,7 +1926,7 @@ void printJSON()
     Serial.print(debugger);
 
     Serial.print(F(", \"DeltaTime\": "));
-    Serial.print(madDeltaTime* 1000000.0);
+    Serial.print(madDeltaTime * 1000000.0);
     Serial.println("}");
   }
 }
@@ -1978,7 +1983,7 @@ void printtock()
     Serial.print(F("inner microseconds = "));
     Serial.print(innerLoopMicroseconds);
     Serial.print(F("   deltaTime = "));
-    Serial.println(deltaTime * 1000000.0);
+    Serial.println(madDeltaTime * 1000000.0);
     
   }
 }
@@ -2482,7 +2487,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<table>";
   body += "<tr><td>Desired Roll=" + String(roll_des) + "&#176;</td><td>IMU Roll=" + String(roll_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Desired Pitch=" + String(pitch_des) + "&#176;</td><td>IMU Pitch=" + String(pitch_IMU) + "&#176;</td></tr>";
-  body += "<tr><td>Loop Time=" + String(int(round((deltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(PWM_throttle) + "</td></tr>";
+  body += "<tr><td>Loop Time=" + String(int(round((madDeltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(PWM_throttle) + "</td></tr>";
   body += "<tr><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
   body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(highestThrottlePWM) + "</td></tr>";
   body += "<tr><td>Lowest Throttle=" + String(lowestThrottlePWM) + "</td><td>Battery=" + String(calced_voltage, 1) + "V (" + String(batteryVoltage) + ")</td></tr>";
@@ -2551,7 +2556,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(trimYaw) + "'></td></tr>";
   body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(throttleLimit, 2) + "'></td></tr>";
   body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(UP_COEFF, 3) + "'></td></tr>";
-  body += "<tr><td>Down Dampening (0.0001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.0001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 4) + "'></td></tr>";
+  body += "<tr><td>Down Dampening (0.00001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.00001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 5) + "'></td></tr>";
   body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(failsafeCoeff, 6) + "'></td></tr>";
   body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(stick_dampener, 3) + "'></td></tr>";
   body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(Accel_filter) + "'></td></tr>";
