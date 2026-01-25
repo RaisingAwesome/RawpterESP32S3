@@ -11,7 +11,7 @@
 #include "driver/gpio.h"                     // ESP32-S3 routines to speed up digitalWrite
 #include "driver/rmt_rx.h"                   // ESP32-S3 routines for remote PPM pulse capture
 #include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
-
+#include "driver/mcpwm_prelude.h"            // ESP32-S3 routines for motor control
 // ========================================================================================================================//
 //                                               USER-SPECIFIED VARIABLES                                                 //
 // ========================================================================================================================//
@@ -24,12 +24,7 @@
 #define MOTOR_FREQ_HZ 250.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point. 250 will evenly put it in the inner loop
 #define RAMP_DURATION_SEC 0.35f      // how long in seconds to take a command a motor to go from 1000 PWM to 2000 PWM. The ConditionCommands() is the routine that ramps it. Keeps it from body slamming itself on a spike.
 #define ALT_FREQ_HZ 100.0f           // Check altitude just 100 times per second.
-
-#define ESC_RESOLUTION 14            // Bits to use for PWM pulses. 14 is the max on the ESC-S3
 #define ESC_FREQ_HZ 400              // The full HZ tick width of each Simonk frame for PWM.
-#define ESC_PERIOD_US 2500           // Microseconds of 400HZ
-#define ESC_MAX_DUTY 16383           // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty. Change if you change ESC HZ
-#define ESC_US_TO_DUTY 6.5536f       // The ESP ledc library uses duty versus uS. So we have to convert microseconds to duty. Change if you change ESC HZ
 
 // Parameter Storage
 #include <Preferences.h>
@@ -137,6 +132,10 @@ static const int m1Pin = 1; // IO1, Pin 5
 static const int m2Pin = 3; // IO3
 static const int m3Pin = 5; // IO5
 static const int m4Pin = 4; // IO4
+mcpwm_timer_handle_t timer_m1, timer_m2, timer_m3, timer_m4; 
+mcpwm_oper_handle_t oper_m1, oper_m2, oper_m3, oper_m4;
+mcpwm_cmpr_handle_t cmp_m1, cmp_m2, cmp_m3, cmp_m4;
+mcpwm_gen_handle_t gen_m1, gen_m2, gen_m3, gen_m4;
 
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
@@ -271,7 +270,7 @@ void loop()
   //times += "\t" + String(temp,3);
   //Serial.println(times);
   tock();                                   // Yields until the end of the the inner loop pacing
-  //troubleShooting();
+  troubleShooting();
 }
 
 inline void tick()
@@ -514,7 +513,7 @@ void setupGPS()
   delay(100); // give time for Wire to settle.
   if (!gps.Max10SGPS.begin(Wire))
   {
-    Serial.println("u-blox GNSS not detected over I2C. Check wiring and power.");
+    Serial.println("u-blox GNSS not detected over I2C. If installed, you might need to reflow.");
     gps.hasGPS = false;
     return;
   }
@@ -711,34 +710,85 @@ void waitForRadio()
 
 void setupMotorCommunication()
 {
-  // Initialize all pins
+    const uint32_t resolution_hz = 1'000'000;   // 1 MHz → 1 tick = 1 µs
+    const uint32_t period_us     = resolution_hz/ESC_FREQ_HZ;        // 400 Hz = 2500 µs period
 
-  bool checker = ledcSetClockSource(LEDC_USE_XTAL_CLK);
-  checker = ledcAttach(m1Pin, ESC_FREQ_HZ, ESC_RESOLUTION);
-  checker = ledcAttach(m2Pin, ESC_FREQ_HZ, ESC_RESOLUTION);
-  checker = ledcAttach(m3Pin, ESC_FREQ_HZ, ESC_RESOLUTION);
-  checker = ledcAttach(m4Pin, ESC_FREQ_HZ, ESC_RESOLUTION);
+    // Helper lambda to create one PWM channel
+    auto make_channel = [&](int gpio,
+                            int unit,
+                            int timer,
+                            mcpwm_timer_handle_t &t,
+                            mcpwm_oper_handle_t &o,
+                            mcpwm_cmpr_handle_t &c,
+                            mcpwm_gen_handle_t &g)
+    {
+        // Timer
+        mcpwm_timer_config_t tcfg = {
+            .group_id = unit,
+            .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
+            .resolution_hz = resolution_hz,
+            .period_ticks = period_us,
+            .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
+        };
+        mcpwm_new_timer(&tcfg, &t);
 
-  Serial.println("Set up ledc for Motor Communication.");
+        // Operator
+        mcpwm_operator_config_t ocfg = { .group_id = unit };
+        mcpwm_new_operator(&ocfg, &o);
+        mcpwm_operator_connect_timer(o, t);
 
-  //calibrateESCs(); //ONLY ENABLE WITHOUT PROPS!!!!!!!!!! This is written in blood!
+        // Comparator
+        mcpwm_comparator_config_t ccfg = {
+            .flags.update_cmp_on_tez = true
+        };
+        mcpwm_new_comparator(o, &ccfg, &c);
 
-  m1_command_PWM = 1000; // Will send the default for motor stopped for Simonk firmware once the radio is detected later in the setup()
-  m2_command_PWM = 1000;
-  m3_command_PWM = 1000;
-  m4_command_PWM = 1000;
+        // Generator (A output only)
+        mcpwm_generator_config_t gcfg = {
+            .gen_gpio_num = gpio
+        };
+        mcpwm_new_generator(o, &gcfg, &g);
 
-  // Just in case, make sure the variables that hold radio values are safe.
-  PWM_throttle = PWM_throttle_zero;
-  PWM_roll = PWM_roll_fs;
-  PWM_pitch = PWM_pitch_fs;
-  PWM_yaw = PWM_yaw_fs;
-}
+        // Define waveform: HIGH at start, LOW at compare
+        mcpwm_generator_set_action_on_timer_event(
+            g,
+            MCPWM_GEN_TIMER_EVENT_ACTION(
+                MCPWM_TIMER_DIRECTION_UP,
+                MCPWM_TIMER_EVENT_ZERO,
+                MCPWM_GEN_ACTION_HIGH));
 
-inline void ESCWriteMicroseconds(int gpio, int us)
-{
-  int duty = (int)(us * ESC_US_TO_DUTY);
-  ledcWrite(gpio, duty);
+        mcpwm_generator_set_action_on_compare_event(
+            g,
+            MCPWM_GEN_COMPARE_EVENT_ACTION(
+                MCPWM_TIMER_DIRECTION_UP,
+                c,
+                MCPWM_GEN_ACTION_LOW));
+
+        // Start timer
+        mcpwm_timer_enable(t);
+        mcpwm_timer_start_stop(t, MCPWM_TIMER_START_NO_STOP);
+    };
+
+    // Create 4 channels
+    make_channel(m1Pin, 0, 0, timer_m1, oper_m1, cmp_m1, gen_m1);
+    make_channel(m2Pin, 0, 1, timer_m2, oper_m2, cmp_m2, gen_m2);
+    make_channel(m3Pin, 0, 2, timer_m3, oper_m3, cmp_m3, gen_m3);
+    make_channel(m4Pin, 1, 0, timer_m4, oper_m4, cmp_m4, gen_m4);
+
+    Serial.println("Set up MCPWM for Motor Communication.");
+    
+    //calibrateESCs(); // Uncomment to calibrate ESCs on startup.  Make sure to have props off and be ready to cut power after calibration.
+   
+    // Initial ESC-safe values
+    m1_command_PWM = 1000;
+    m2_command_PWM = 1000;
+    m3_command_PWM = 1000;
+    m4_command_PWM = 1000;
+
+    PWM_throttle = PWM_throttle_zero;
+    PWM_roll     = PWM_roll_fs;
+    PWM_pitch    = PWM_pitch_fs;
+    PWM_yaw      = PWM_yaw_fs;
 }
 
 void setupBatteryMonitor()
@@ -1042,7 +1092,7 @@ void setupPPM()
   radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
 }
 
-inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, unsigned long dt)
+inline void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, float dt)
 {
   // Precomputed constants
   constexpr float DEG2RAD = 0.01745329252f; // π/180
@@ -1574,27 +1624,27 @@ inline void motorPipeline()
 
 inline void commandMotors()
 {
-  // DESCRIPTION: Send pulses to motor pins
-  if (EASYCHAIR)
-  {
-    ESCWriteMicroseconds(m1Pin, 1000);
-    ESCWriteMicroseconds(m2Pin, 1000);
-    ESCWriteMicroseconds(m3Pin, 1000);
-    ESCWriteMicroseconds(m4Pin, 1000);
-  }
-  else
-  {
-    ESCWriteMicroseconds(m1Pin, m1_command_PWM);
-    ESCWriteMicroseconds(m2Pin, m2_command_PWM);
-    ESCWriteMicroseconds(m3Pin, m3_command_PWM);
-    ESCWriteMicroseconds(m4Pin, m4_command_PWM);
-  }
+    if (EASYCHAIR)
+    {
+        mcpwm_comparator_set_compare_value(cmp_m1, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m2, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m3, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m4, 1000);
+    }
+    else
+    {
+        mcpwm_comparator_set_compare_value(cmp_m1, m1_command_PWM);
+        mcpwm_comparator_set_compare_value(cmp_m2, m2_command_PWM);
+        mcpwm_comparator_set_compare_value(cmp_m3, m3_command_PWM);
+        mcpwm_comparator_set_compare_value(cmp_m4, m4_command_PWM);
+    }
 }
+
 
 inline void scaleMotorCommandsToPWM()
 {
   // DESCRIPTION: Scale normalized actuator commands to values for ESC protocol
-  // The actual pulse frame is set at the ledc attach.
+  // The actual pulse frame is set at the setupMotorCommunication.
   //
   // Scale to Servo PWM 1000-2000 microseconds for stop to full speed.  No need to constrain since mx_command_scaled already is.
   m1_command_PWM = throttleLimit * m1_command_scaled * 1000 + 1000;
@@ -1605,26 +1655,34 @@ inline void scaleMotorCommandsToPWM()
 /*
 inline void calibrateESCs()
 {
-  // DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
-  // If the Throttle kill switch is in the up position, then skip calibration. To calibrate, turn on the
-  // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  It takes around 8 seconds.
-  return; //only do without props
-  
-  Serial.println("Calibrating ESCs...");
-  ESCWriteMicroseconds(m1Pin, 2000);
-  ESCWriteMicroseconds(m2Pin, 2000);
-  ESCWriteMicroseconds(m3Pin, 2000);
-  ESCWriteMicroseconds(m4Pin, 2000);
-  delay(2000);
-  ESCWriteMicroseconds(m1Pin, 1000);
-  ESCWriteMicroseconds(m2Pin, 1000);
-  ESCWriteMicroseconds(m3Pin, 1000);
-  ESCWriteMicroseconds(m4Pin, 1000);
-  delay(1000);
-  Serial.println("Calibration complete.");
-  while (true) delay(10); // stall out to encourage commenting this back out after calibration - written in blood approach.
-  
+    // DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
+    // If the Throttle kill switch is in the up position, then skip calibration. To calibrate, turn on the
+    // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  
+    // It takes around 8 seconds.
+    return; // only do without props
+
+    Serial.println("Calibrating ESCs...");
+
+    // Full throttle (2000 µs)
+    mcpwm_comparator_set_compare_value(cmp_m1, 2000);
+    mcpwm_comparator_set_compare_value(cmp_m2, 2000);
+    mcpwm_comparator_set_compare_value(cmp_m3, 2000);
+    mcpwm_comparator_set_compare_value(cmp_m4, 2000);
+    delay(2000);
+
+    // Minimum throttle (1000 µs)
+    mcpwm_comparator_set_compare_value(cmp_m1, 1000);
+    mcpwm_comparator_set_compare_value(cmp_m2, 1000);
+    mcpwm_comparator_set_compare_value(cmp_m3, 1000);
+    mcpwm_comparator_set_compare_value(cmp_m4, 1000);
+    delay(1000);
+
+    Serial.println("Calibration complete.");
+
+    // Stall out to force the user to comment this back out after calibration.
+    while (true) delay(10);
 }
+
 */
 void throttleCut()
 {
@@ -2597,19 +2655,26 @@ void GenerateDefaultPage(WiFiClient &client)
 
 /*
 void motorTest()
-{ // Used to check rotation on the bench. NO PROPS!
-  return;
-  for (int ii=0;ii<5;ii++)
-  {
-    ESCWriteMicroseconds(m1Pin, 1000);
-    ESCWriteMicroseconds(m2Pin, 1000);
-    ESCWriteMicroseconds(m3Pin, 1000);
-    ESCWriteMicroseconds(m4Pin, 1000);
-    delay(2000);
-    ESCWriteMicroseconds(m1Pin, 1100);
-    ESCWriteMicroseconds(m2Pin, 1100);
-    ESCWriteMicroseconds(m3Pin, 1100);
-    ESCWriteMicroseconds(m4Pin, 1100);
-    delay(2000);
-  }
+{ 
+    // Used to check rotation on the bench. NO PROPS!
+    return;
+
+    for (int ii = 0; ii < 5; ii++)
+    {
+        // Idle (1000 µs)
+        mcpwm_comparator_set_compare_value(cmp_m1, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m2, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m3, 1000);
+        mcpwm_comparator_set_compare_value(cmp_m4, 1000);
+        delay(2000);
+
+        // Slight throttle (1100 µs)
+        mcpwm_comparator_set_compare_value(cmp_m1, 1100);
+        mcpwm_comparator_set_compare_value(cmp_m2, 1100);
+        mcpwm_comparator_set_compare_value(cmp_m3, 1100);
+        mcpwm_comparator_set_compare_value(cmp_m4, 1100);
+        delay(2000);
+    }
+}
+
 */
