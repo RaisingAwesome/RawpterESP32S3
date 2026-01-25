@@ -14,7 +14,7 @@ Rawpter is a custom flight controller for a quadcopter. It is based on the ESP32
 - 250Hz Outer Loop Angle PI controller based on remote radio sticks
 - 250Hz Command Mixer to drive Simonk Firmware driven ESCs
 - Motor PWM driven by ESP32 MCPWM @ 400Hz
-- 8 Channel PPM Remote Receiver Hardware Pulse Capture using rmtRead @ 50HZ PPM Frame Duration per Flysky FS-i6X Transmitter
+- 8 Channel PPM Remote Receiver Hardware Pulse Capture using rmtRead @ 50HZ PPM Frame Duration per Flysky FS-i6X Transmitter. Non-blocking, hardware driven
 - Two cores strategically orchestrated with FreeRTOS
 - Clever variable management with FreeRTOS Task Notification and double buffering to ensure no corrupt data from multiple threads across cores for sensor fusion
 - Clever Radio Failsafe to automatically descend safely via optional GPS return to location
