@@ -128,14 +128,8 @@ static int throttleNotCutCounter = 0;
 static rmt_channel_handle_t rx_channel;
 
 // Motor Electronic Speed Control Modules (ESC):
-static const int m1Pin = 1; // IO1, Pin 5
-static const int m2Pin = 3; // IO3
-static const int m3Pin = 5; // IO5
-static const int m4Pin = 4; // IO4
-mcpwm_timer_handle_t timer_m1, timer_m2, timer_m3, timer_m4; 
-mcpwm_oper_handle_t oper_m1, oper_m2, oper_m3, oper_m4;
-mcpwm_cmpr_handle_t cmp_m1, cmp_m2, cmp_m3, cmp_m4;
-mcpwm_gen_handle_t gen_m1, gen_m2, gen_m3, gen_m4;
+const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
+mcpwm_cmpr_handle_t comparators[4];
 
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
@@ -510,62 +504,77 @@ void halt()
 
 void setupGPS()
 {
-  delay(100); // give time for Wire to settle.
+  delay(100);
+
   if (!gps.Max10SGPS.begin(Wire))
   {
-    Serial.println("u-blox GNSS not detected over I2C. If installed, you might need to reflow.");
+    Serial.println("u-blox GNSS not detected over I2C.");
     gps.hasGPS = false;
     return;
   }
+
   gps.hasGPS = true;
   Serial.println("U-Blox GPS discovered.");
 
-  // Configure output protocol and update rate
-  gps.Max10SGPS.setI2COutput(COM_TYPE_UBX); // UBX binary only
-  gps.Max10SGPS.setNavigationFrequency(1);  // 1 Hz navigation solution
-  gps.Max10SGPS.setAutoPVT(true);           // Auto PVT messages
+  gps.Max10SGPS.setI2COutput(COM_TYPE_UBX);
+  gps.Max10SGPS.setNavigationFrequency(1);
+  gps.Max10SGPS.setAutoPVT(true);
 
-  // UBX-CFG-TP5: enable TIMEPULSE at 1 Hz, 50% duty, aligned to GNSS time
-  uint8_t ubxTP5[] = {
-      0xB5, 0x62, // Sync chars
-      0x06, 0x31, // Class = CFG (0x06), ID = TP5 (0x31)
-      0x20, 0x00, // Length = 32 bytes
+  //
+  // --- Configure TIMEPULSE using raw UBX-CFG-TP5 ---
+  //
+  uint8_t tp5[] = {
+    0xB5, 0x62,             // Sync chars
+    0x06, 0x31,             // Class = CFG, ID = TP5
+    0x20, 0x00,             // Length = 32 bytes
 
-      // Payload (32 bytes)
-      0x00,                   // tpIdx = 0 (TIMEPULSE pin)
-      0x00,                   // reserved
-      0xE8, 0x03, 0x00, 0x00, // freqPeriod = 1000 (1 Hz)
-      0xE8, 0x03, 0x00, 0x00, // freqPeriodLock = 1000
-      0xF4, 0x01, 0x00, 0x00, // pulseLen = 500 ms (50% duty)
-      0xF4, 0x01, 0x00, 0x00, // pulseLenLock = 500 ms
-      0x00, 0x00, 0x00, 0x00, // userConfigDelay
-      0x81, 0x00, 0x00, 0x00, // flags: enable, aligned to GPS time
-      0x00, 0x00, 0x00, 0x00, // reserved
-      0x00, 0x00              // checksum placeholder
+    // Payload (32 bytes)
+    0x00,                   // tpIdx = 0 (TIMEPULSE pin)
+    0x00,                   // reserved
+
+    // freqPeriod = 1 Hz → 1,000,000 µs
+    0x40, 0x42, 0x0F, 0x00, // 1,000,000 (0x000F4240)
+
+    // freqPeriodLock = same
+    0x40, 0x42, 0x0F, 0x00,
+
+    // pulseLen = 500,000 µs (50% duty)
+    0x20, 0xA1, 0x07, 0x00, // 500,000 (0x0007A120)
+
+    // pulseLenLock = same
+    0x20, 0xA1, 0x07, 0x00,
+
+    // userConfigDelay
+    0x00, 0x00, 0x00, 0x00,
+
+    // flags:
+    // bit0 = active
+    // bit1 = lockGpsFreq
+    // bit2 = lockedOtherSet
+    // bit6 = alignToTow
+    // bit7 = isAlwaysOn (pulse even without fix)
+    0xC7, 0x00, 0x00, 0x00, // 0xC7 = 1100 0111
+
+    // reserved
+    0x00, 0x00,
+    0x00, 0x00
   };
 
-  // Calculate checksum
-  uint8_t ckA, ckB;
-  calcChecksum(ubxTP5, sizeof(ubxTP5), ckA, ckB);
-  ubxTP5[sizeof(ubxTP5) - 2] = ckA;
-  ubxTP5[sizeof(ubxTP5) - 1] = ckB;
-
-  // Send raw UBX message
-  gps.Max10SGPS.pushRawData(ubxTP5, sizeof(ubxTP5));
-  delay(100);
-  Serial.println("UBX-CFG-TP5 sent: TIMEPULSE enabled at 1 Hz.");
-}
-
-void calcChecksum(uint8_t *msg, uint16_t len, uint8_t &ckA, uint8_t &ckB)
-{
-  ckA = 0;
-  ckB = 0;
-  for (uint16_t i = 2; i < len - 2; i++)
+  // Compute checksum
+  uint8_t ckA = 0, ckB = 0;
+  for (int i = 2; i < sizeof(tp5) - 2; i++)
   {
-    ckA += msg[i];
+    ckA += tp5[i];
     ckB += ckA;
   }
+  tp5[sizeof(tp5) - 2] = ckA;
+  tp5[sizeof(tp5) - 1] = ckB;
+
+  gps.Max10SGPS.pushRawData(tp5, sizeof(tp5));
+
+  Serial.println("TIMEPULSE configured: 1 Hz, 50% duty, always on.");
 }
+
 
 void printGPS()
 {
@@ -710,76 +719,61 @@ void waitForRadio()
 
 void setupMotorCommunication()
 {
-    const uint32_t resolution_hz = 1'000'000;   // 1 MHz → 1 tick = 1 µs
-    const uint32_t period_us     = resolution_hz/ESC_FREQ_HZ;        // 400 Hz = 2500 µs period
 
-    // Helper lambda to create one PWM channel
-    auto make_channel = [&](int gpio,
-                            int unit,
-                            int timer,
-                            mcpwm_timer_handle_t &t,
-                            mcpwm_oper_handle_t &o,
-                            mcpwm_cmpr_handle_t &c,
-                            mcpwm_gen_handle_t &g)
-    {
-        // Timer
-        mcpwm_timer_config_t tcfg = {
-            .group_id = unit,
-            .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
-            .resolution_hz = resolution_hz,
-            .period_ticks = period_us,
-            .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
-        };
-        mcpwm_new_timer(&tcfg, &t);
+    Serial.println("Initializing Split-Group MCPWM for 4 Motors...");
+
+    mcpwm_timer_handle_t timers[2] = {NULL, NULL};
+    
+    // Initialize Timer for Group 0 and Group 1
+    for (int g = 0; g < 2; g++) {
+        mcpwm_timer_config_t timer_config = {};
+        timer_config.group_id = g;
+        timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
+        timer_config.resolution_hz = 1000000;
+        timer_config.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
+        timer_config.period_ticks = 2500; // 400Hz
+        ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[g]));
+    }
+
+    for (int i = 0; i < 4; i++) {
+        int group = (i < 2) ? 0 : 1; // 0 & 1 on Group 0 | 2 & 3 on Group 1
 
         // Operator
-        mcpwm_operator_config_t ocfg = { .group_id = unit };
-        mcpwm_new_operator(&ocfg, &o);
-        mcpwm_operator_connect_timer(o, t);
+        mcpwm_oper_handle_t oper = NULL;
+        mcpwm_operator_config_t oper_config = {};
+        oper_config.group_id = group;
+        ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &oper));
+        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timers[group]));
+
+        // Generator
+        mcpwm_gen_handle_t gen = NULL;
+        mcpwm_generator_config_t gen_config = {};
+        gen_config.gen_gpio_num = motor_pins[i];
+        ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &gen));
 
         // Comparator
-        mcpwm_comparator_config_t ccfg = {
-            .flags.update_cmp_on_tez = true
-        };
-        mcpwm_new_comparator(o, &ccfg, &c);
+        mcpwm_comparator_config_t comp_config = {};
+        comp_config.flags.update_cmp_on_tez = true;
+        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &comparators[i]));
 
-        // Generator (A output only)
-        mcpwm_generator_config_t gcfg = {
-            .gen_gpio_num = gpio
-        };
-        mcpwm_new_generator(o, &gcfg, &g);
+        mcpwm_comparator_set_compare_value(comparators[i], 1000);
 
-        // Define waveform: HIGH at start, LOW at compare
-        mcpwm_generator_set_action_on_timer_event(
-            g,
-            MCPWM_GEN_TIMER_EVENT_ACTION(
-                MCPWM_TIMER_DIRECTION_UP,
-                MCPWM_TIMER_EVENT_ZERO,
-                MCPWM_GEN_ACTION_HIGH));
+        // Actions
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(gen,
+            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(gen,
+            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW)));
+    }
 
-        mcpwm_generator_set_action_on_compare_event(
-            g,
-            MCPWM_GEN_COMPARE_EVENT_ACTION(
-                MCPWM_TIMER_DIRECTION_UP,
-                c,
-                MCPWM_GEN_ACTION_LOW));
+    // Start both timers
+    for (int g = 0; g < 2; g++) {
+        ESP_ERROR_CHECK(mcpwm_timer_enable(timers[g]));
+        ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[g], MCPWM_TIMER_START_NO_STOP));
+    }
 
-        // Start timer
-        mcpwm_timer_enable(t);
-        mcpwm_timer_start_stop(t, MCPWM_TIMER_START_NO_STOP);
-    };
-
-    // Create 4 channels
-    make_channel(m1Pin, 0, 0, timer_m1, oper_m1, cmp_m1, gen_m1);
-    make_channel(m2Pin, 0, 1, timer_m2, oper_m2, cmp_m2, gen_m2);
-    make_channel(m3Pin, 0, 2, timer_m3, oper_m3, cmp_m3, gen_m3);
-    make_channel(m4Pin, 1, 0, timer_m4, oper_m4, cmp_m4, gen_m4);
-
-    Serial.println("Set up MCPWM for Motor Communication.");
-    
-    //calibrateESCs(); // Uncomment to calibrate ESCs on startup.  Make sure to have props off and be ready to cut power after calibration.
-   
-    // Initial ESC-safe values
+    Serial.println("MCPWM: All 4 motors initialized across 2 groups.");
+    //calibrateESCs();
+    // Safe ESC idle values
     m1_command_PWM = 1000;
     m2_command_PWM = 1000;
     m3_command_PWM = 1000;
@@ -1626,20 +1620,19 @@ inline void commandMotors()
 {
     if (EASYCHAIR)
     {
-        mcpwm_comparator_set_compare_value(cmp_m1, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m2, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m3, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m4, 1000);
+      mcpwm_comparator_set_compare_value(comparators[0], 1000);
+      mcpwm_comparator_set_compare_value(comparators[1], 1000);
+      mcpwm_comparator_set_compare_value(comparators[2], 1000);
+      mcpwm_comparator_set_compare_value(comparators[3], 1000);
     }
     else
     {
-        mcpwm_comparator_set_compare_value(cmp_m1, m1_command_PWM);
-        mcpwm_comparator_set_compare_value(cmp_m2, m2_command_PWM);
-        mcpwm_comparator_set_compare_value(cmp_m3, m3_command_PWM);
-        mcpwm_comparator_set_compare_value(cmp_m4, m4_command_PWM);
+      mcpwm_comparator_set_compare_value(comparators[0], m1_command_PWM);
+      mcpwm_comparator_set_compare_value(comparators[1], m2_command_PWM);
+      mcpwm_comparator_set_compare_value(comparators[2], m3_command_PWM);
+      mcpwm_comparator_set_compare_value(comparators[3], m4_command_PWM);
     }
 }
-
 
 inline void scaleMotorCommandsToPWM()
 {

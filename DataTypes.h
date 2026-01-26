@@ -55,6 +55,12 @@
 #define CHANNELS 6    // number of channels
 #define BLANK_US 4000 // blank time threshold in µs
 
+// Motors
+#define m1Pin 1 // IO1
+#define m2Pin 3 // IO3
+#define m3Pin 5 // IO5
+#define m4Pin 4 // IO4
+
 struct AltitudeData
 {
   BMP581 pressureSensor;
