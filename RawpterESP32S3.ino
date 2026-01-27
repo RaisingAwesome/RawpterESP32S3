@@ -24,7 +24,7 @@
 #define MOTOR_FREQ_HZ 250.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point. 250 will evenly put it in the inner loop
 #define RAMP_DURATION_SEC 0.35f      // how long in seconds to take a command a motor to go from 1000 PWM to 2000 PWM. The ConditionCommands() is the routine that ramps it. Keeps it from body slamming itself on a spike.
 #define ALT_FREQ_HZ 100.0f           // Check altitude just 100 times per second.
-#define ESC_FREQ_HZ 400              // The full HZ tick width of each Simonk frame for PWM.
+#define ESC_FREQ_HZ 250              // The full HZ tick width of each Simonk frame for PWM.
 
 // Parameter Storage
 #include <Preferences.h>
@@ -502,10 +502,8 @@ void halt()
     delay(100); // lock forever
 }
 
-void setupGPS()
-{
+void setupGPS() {
   delay(100);
-
   if (!gps.Max10SGPS.begin(Wire))
   {
     Serial.println("u-blox GNSS not detected over I2C.");
@@ -515,66 +513,44 @@ void setupGPS()
 
   gps.hasGPS = true;
   Serial.println("U-Blox GPS discovered.");
-
+  Serial.print("Firmware Version: ");
+  Serial.println(gps.Max10SGPS.getProtocolVersionHigh());
   gps.Max10SGPS.setI2COutput(COM_TYPE_UBX);
   gps.Max10SGPS.setNavigationFrequency(1);
   gps.Max10SGPS.setAutoPVT(true);
 
-  //
-  // --- Configure TIMEPULSE using raw UBX-CFG-TP5 ---
-  //
-  uint8_t tp5[] = {
-    0xB5, 0x62,             // Sync chars
-    0x06, 0x31,             // Class = CFG, ID = TP5
-    0x20, 0x00,             // Length = 32 bytes
-
-    // Payload (32 bytes)
-    0x00,                   // tpIdx = 0 (TIMEPULSE pin)
-    0x00,                   // reserved
-
-    // freqPeriod = 1 Hz → 1,000,000 µs
-    0x40, 0x42, 0x0F, 0x00, // 1,000,000 (0x000F4240)
-
-    // freqPeriodLock = same
-    0x40, 0x42, 0x0F, 0x00,
-
-    // pulseLen = 500,000 µs (50% duty)
-    0x20, 0xA1, 0x07, 0x00, // 500,000 (0x0007A120)
-
-    // pulseLenLock = same
-    0x20, 0xA1, 0x07, 0x00,
-
-    // userConfigDelay
-    0x00, 0x00, 0x00, 0x00,
-
-    // flags:
-    // bit0 = active
-    // bit1 = lockGpsFreq
-    // bit2 = lockedOtherSet
-    // bit6 = alignToTow
-    // bit7 = isAlwaysOn (pulse even without fix)
-    0xC7, 0x00, 0x00, 0x00, // 0xC7 = 1100 0111
-
-    // reserved
-    0x00, 0x00,
-    0x00, 0x00
-  };
-
-  // Compute checksum
-  uint8_t ckA = 0, ckB = 0;
-  for (int i = 2; i < sizeof(tp5) - 2; i++)
-  {
-    ckA += tp5[i];
-    ckB += ckA;
-  }
-  tp5[sizeof(tp5) - 2] = ckA;
-  tp5[sizeof(tp5) - 1] = ckB;
-
-  gps.Max10SGPS.pushRawData(tp5, sizeof(tp5));
-
   Serial.println("TIMEPULSE configured: 1 Hz, 50% duty, always on.");
-}
 
+  gps.Max10SGPS.newCfgValset(VAL_LAYER_RAM); 
+
+  // 1. Enable the pulse (Using your exact key)
+  gps.Max10SGPS.addCfgValset(0x10050007, 1); // CFG-TP-TP1_ENA
+
+  // 2. Set Pulse Definition to Period (0)
+  gps.Max10SGPS.addCfgValset(0x20050023, 0); // CFG-TP-PULSE_DEF
+
+  // 3. Set Length Definition to Length [us] (0)
+  gps.Max10SGPS.addCfgValset(0x20050030, 0); // CFG-TP-PULSE_LENGTH_DEF
+
+  // 4. Set Period to 1s (1,000,000 us)
+  gps.Max10SGPS.addCfgValset(0x40050002, 1000000); // CFG-TP-PERIOD_TP1
+
+  // 5. Set Length to 0.5s (500,000 us)
+  gps.Max10SGPS.addCfgValset(0x40050004, 500000);  // CFG-TP-LEN_TP1
+
+  // 6. Don't wait for GNSS Lock (Set to False/0)
+  // This is key ID 0x10050009 from your list
+  gps.Max10SGPS.addCfgValset(0x10050009, 0); // CFG-TP-USE_LOCKED_TP1
+
+  // 7. Polarity High (1)
+  gps.Max10SGPS.addCfgValset(0x1005000b, 1); // CFG-TP-POL_TP1
+
+  if (gps.Max10SGPS.sendCfgValset()) {
+    Serial.println("Config sent. Searching for satellites...");
+  } else {
+    Serial.println("Problem: GPS Module could not be configured!");
+  }
+}
 
 void printGPS()
 {
@@ -719,66 +695,66 @@ void waitForRadio()
 
 void setupMotorCommunication()
 {
-
-    Serial.println("Initializing Split-Group MCPWM for 4 Motors...");
+    Serial.println("Initializing Split-Group MCPWM with Phase Shift...");
 
     mcpwm_timer_handle_t timers[2] = {NULL, NULL};
+    uint32_t period = 1000000 / ESC_FREQ_HZ;
     
-    // Initialize Timer for Group 0 and Group 1
     for (int g = 0; g < 2; g++) {
         mcpwm_timer_config_t timer_config = {};
         timer_config.group_id = g;
         timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
         timer_config.resolution_hz = 1000000;
         timer_config.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
-        timer_config.period_ticks = 2500; // 400Hz
+        timer_config.period_ticks = period;
         ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[g]));
     }
 
+    // --- PHASE SHIFT LOGIC ---
+    // Instead of chaining Group 0 to Group 1, we initialize them normally.
+    // To stagger them, we manually start Group 1 with an offset.
+    
     for (int i = 0; i < 4; i++) {
-        int group = (i < 2) ? 0 : 1; // 0 & 1 on Group 0 | 2 & 3 on Group 1
+        int group = (i < 2) ? 0 : 1; 
 
-        // Operator
         mcpwm_oper_handle_t oper = NULL;
-        mcpwm_operator_config_t oper_config = {};
-        oper_config.group_id = group;
+        mcpwm_operator_config_t oper_config = { .group_id = group };
         ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &oper));
         ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timers[group]));
 
-        // Generator
         mcpwm_gen_handle_t gen = NULL;
-        mcpwm_generator_config_t gen_config = {};
-        gen_config.gen_gpio_num = motor_pins[i];
+        mcpwm_generator_config_t gen_config = { .gen_gpio_num = motor_pins[i] };
         ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &gen));
 
-        // Comparator
         mcpwm_comparator_config_t comp_config = {};
         comp_config.flags.update_cmp_on_tez = true;
         ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &comparators[i]));
 
         mcpwm_comparator_set_compare_value(comparators[i], 1000);
 
-        // Actions
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(gen,
             MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(gen,
             MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW)));
     }
 
-    // Start both timers
-    for (int g = 0; g < 2; g++) {
-        ESP_ERROR_CHECK(mcpwm_timer_enable(timers[g]));
-        ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[g], MCPWM_TIMER_START_NO_STOP));
-    }
+    // Enable both
+    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[0]));
+    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[1]));
 
-    Serial.println("MCPWM: All 4 motors initialized across 2 groups.");
-    //calibrateESCs();
-    // Safe ESC idle values
-    m1_command_PWM = 1000;
-    m2_command_PWM = 1000;
-    m3_command_PWM = 1000;
-    m4_command_PWM = 1000;
+    // Start Group 0 immediately
+    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[0], MCPWM_TIMER_START_NO_STOP));
+    
+    // DELAY start of Group 1 by half the period to stagger the current hit on changes
+    delayMicroseconds(period / 2); 
+    
+    // Start Group 1
+    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[1], MCPWM_TIMER_START_NO_STOP));
 
+    Serial.println("MCPWM: Groups staggered using timed-start.");
+    
+    // Reset command values
+    m1_command_PWM = m2_command_PWM = m3_command_PWM = m4_command_PWM = 1000;
     PWM_throttle = PWM_throttle_zero;
     PWM_roll     = PWM_roll_fs;
     PWM_pitch    = PWM_pitch_fs;
@@ -1657,17 +1633,19 @@ inline void calibrateESCs()
     Serial.println("Calibrating ESCs...");
 
     // Full throttle (2000 µs)
-    mcpwm_comparator_set_compare_value(cmp_m1, 2000);
-    mcpwm_comparator_set_compare_value(cmp_m2, 2000);
-    mcpwm_comparator_set_compare_value(cmp_m3, 2000);
-    mcpwm_comparator_set_compare_value(cmp_m4, 2000);
+      mcpwm_comparator_set_compare_value(comparators[0], 2000);
+      mcpwm_comparator_set_compare_value(comparators[1], 2000);
+      mcpwm_comparator_set_compare_value(comparators[2], 2000);
+      mcpwm_comparator_set_compare_value(comparators[3], 2000);
+
     delay(2000);
 
     // Minimum throttle (1000 µs)
-    mcpwm_comparator_set_compare_value(cmp_m1, 1000);
-    mcpwm_comparator_set_compare_value(cmp_m2, 1000);
-    mcpwm_comparator_set_compare_value(cmp_m3, 1000);
-    mcpwm_comparator_set_compare_value(cmp_m4, 1000);
+      mcpwm_comparator_set_compare_value(comparators[0], 1000);
+      mcpwm_comparator_set_compare_value(comparators[1], 1000);
+      mcpwm_comparator_set_compare_value(comparators[2], 1000);
+      mcpwm_comparator_set_compare_value(comparators[3], 1000);
+
     delay(1000);
 
     Serial.println("Calibration complete.");
