@@ -3,7 +3,7 @@
 // Go to https:// raisingawesome.site/projects for more info
 // MIT License - use at your own risk
 
-constexpr bool BENCH_TESTING false // Used for bench testing safely with USB power only
+constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
 
 #include "Project.h"
 // ========================================================================================================================//
@@ -11,23 +11,19 @@ constexpr bool BENCH_TESTING false // Used for bench testing safely with USB pow
 // ========================================================================================================================//
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
-PIDConstants pid = {};
+PIDConstants pid{};
+AltitudeData altitudeData{};
+GPSData gps{};
+HomePosition homePos{};
 
 // Instantiate per-axis limits (conservative values for 10" props)
-Limits rollLimits = {160.0f}; // maxRate, maxAccel, maxJerk
+Limits rollLimits = {160.0f}; 
 Limits pitchLimits = {160.0f};
 
 static float desiredRateRoll, desiredRatePitch;
 
 // Radio failsafe values for every channel in the event that bad reciever data is detected.
 // These are for it to stay stable and descend safely versus totally cutting throttle and drop like a rock.
-static int16_t PWM_throttle_zero = 1500; // used when we want to take throttle to zero.  Failsafe is something higher as it is expected that failsafe is a value needed to safely land.
-static int16_t PWM_throttle_fs = 1500;
-static int16_t PWM_roll_fs = 1500;              // it quits turning
-static int16_t PWM_pitch_fs = 1500;             // elev
-static int16_t PWM_yaw_fs = 1500;               // rudd
-static int16_t PWM_ThrottleCutSwitch_fs = 2000; // SWA less than 1300, cut throttle, but we don't want to cut throttle, just allow it to decrease so it lands. - must config a switch to Channel 5 in your remote.
-static int16_t PWM_FailsafeSwitch_fs = 1000;    // Used to flag that the receiver had to go to failsafe
 static float stick_dampener = 1.0f;             // 0.1-1 Lower=slower, higher=noiser default 0.7
 static float throttleLimit = 0.6f;              // can be overridden with web interface.
 static bool failsafed = false;
@@ -37,6 +33,7 @@ static bool throttle_is_cut = true; // used to force the pilot to manually set t
 static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
 static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
 static float failsafeCoeff = .00001f;                               // 0.0001 - 0.03 (slow to fast)
+static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
 
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float B_madgwick = 0.02f;
@@ -51,13 +48,9 @@ static float q3 = 0.0f;
 static unsigned long lastMadgwickUpdateMicros = 0;
 static float madDeltaTime = 1 / IMU_FREQ_HZ;
 
-// Pin assignments
-static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
+//Telemetry
 static int16_t highestThrottlePWM = 1500;
 static int16_t lowestThrottlePWM = 2000;
-
-// Pressure Sensor
-AltitudeData altitudeData{};
 
 // PPM variables
 static volatile byte state = LOW;
@@ -81,12 +74,7 @@ static rmt_channel_handle_t rx_channel;
 // Motor Electronic Speed Control Modules (ESC):
 const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
 mcpwm_cmpr_handle_t comparators[4];
-
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
-
-// GPS
-GPSData gps{};
-HomePosition homePos{};
 
 // General stuff for controlling timing of things
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -1834,11 +1822,11 @@ void printJSON()
     Serial.print(derivative_roll);
 
     Serial.print(F(", \"RollKp\": "));
-    Serial.print(Kp_roll_rate);
+    Serial.print(pid.Kp_roll_rate);
     Serial.print(F(", \"RollKi\": "));
-    Serial.print(Ki_roll_rate);
+    Serial.print(pid.Ki_roll_rate);
     Serial.print(F(", \"RollKd\": "));
-    Serial.print(Kd_roll_rate);
+    Serial.print(pid.Kd_roll_rate);
 
     Serial.print(F(", \"m1\": "));
     Serial.print(m1_command_PWM);
@@ -2500,8 +2488,8 @@ void GenerateDefaultPage(WiFiClient &client)
   String(pid.Ki_yaw_rate, 4) + "'></td><td><input type=number step=.00001 name=kd_yaw_rate style='width:100px;' value='" +
   String(pid.Kd_yaw_rate, 5) + "'></td></tr>";
   // Integral limit row
-  body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit_angle style='width:90px;' value='" + String(i_limit_angle) + "'></td>";
-  body += "<td>Rate Integral Max:</td><td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" + String(i_limit_rate) + "'></td></tr>";
+  body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit_angle style='width:90px;' value='" + String(pid.i_limit_angle) + "'></td>";
+  body += "<td>Rate Integral Max:</td><td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" + String(pid.i_limit_rate) + "'></td></tr>";
   body += "<tr><td>B_Madgwick (0.03 default):</td><td><input type=number step=.0001 name=B_madgwick style='width:90px;' value='" +
   String(B_madgwick) + "'></td></tr>";
   body += "</table><br>";

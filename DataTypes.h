@@ -2,6 +2,9 @@
 // Object oriented structs and variables
 #pragma once
 
+#include <SparkFun_BMP581_Arduino_Library.h> // BMP581 Pressure Sensor
+#include <SparkFun_u-blox_GNSS_v3.h>         // Max10S GPS
+
 struct AltitudeData
 {
   BMP581 pressureSensor;
@@ -53,7 +56,7 @@ struct Limits
 
 struct PIDConstants
 {
-  // PID parameters (this is where you "tune it".  It's best to use the WiFi interface to do it live and then update once its tuned.):
+  // PID parameters (this is where you set the.  It's best to use the WiFi interface to do it live and then update once its tuned.):
   float i_limit_angle = 0.5f;      // Integrator saturation level
   float i_limit_rate = 4.0f; // Integrator saturation level
 
@@ -74,6 +77,6 @@ struct PIDConstants
   float Kp_yaw_rate = 0.0015f;   // Yaw P-gain default 30
   float Ki_yaw_rate = 0.003f;    // Yaw I-gain default 5
   float Kd_yaw_rate = 0.0f;      // Yaw D-gain default .015 (be careful when increasing too high, motors will begin to overheat!)
-}
+};
 
 
