@@ -1,56 +1,17 @@
-// Rawpter 8.0 by Sean J. Miller
+// Rawpter 9.0 by Sean J. Miller
 // Flight Controller code for ESP32-S3
 // Go to https:// raisingawesome.site/projects for more info
 // MIT License - use at your own risk
-#include "DataTypes.h"
-#include <SPI.h>                             // SPI Communication Support for IMU
-#include <WiFi.h>                            // ESP32 Adhoc WiFi Support
-#include <WebServer.h>
-#include <Wire.h>                            // I2C Communication for GPS and Pressure Sensor
-#include <functional>
-#include "driver/gpio.h"                     // ESP32-S3 routines to speed up digitalWrite
-#include "driver/rmt_rx.h"                   // ESP32-S3 routines for remote PPM pulse capture
-#include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
-#include "driver/mcpwm_prelude.h"            // ESP32-S3 routines for motor control
+
+constexpr bool BENCH_TESTING false // Used for bench testing safely with USB power only
+
+#include "Project.h"
 // ========================================================================================================================//
 //                                               USER-SPECIFIED VARIABLES                                                 //
 // ========================================================================================================================//
-// EASYCHAIR is used to put in some key dummy variables so you can sit in the easy chair with just the Arduino on a cord wiggling it around and seeing how it responds.
-// Set EASYCHAIR to false when you are wanting to install it in the drone.
-#define EASYCHAIR false
-#define INNER_LOOP_FREQUENCY 1000.0f // The altitude read takes out of processing time. Could get 2K easy if not for it.
-#define IMU_FREQ_HZ 1000.0f          // We will get the IMU data as fast as the inner loop so that we can apply our filters to any noise.
-#define PID_FREQ_HZ 250.0f           // This is limited by how fast your ESCs can change setpoint.
-#define MOTOR_FREQ_HZ 250.0f         // The motor actuation is limited by the ESC Simonk firmware. 400HZ is the fastest you can make a change of pulse set point. 250 will evenly put it in the inner loop
-#define RAMP_DURATION_SEC 0.35f      // how long in seconds to take a command a motor to go from 1000 PWM to 2000 PWM. The ConditionCommands() is the routine that ramps it. Keeps it from body slamming itself on a spike.
-#define ALT_FREQ_HZ 100.0f           // Check altitude just 100 times per second.
-#define ESC_FREQ_HZ 250              // The full HZ tick width of each Simonk frame for PWM.
 
-// Parameter Storage
-#include <Preferences.h>
-Preferences prefs;
-
-// PID parameters (this is where you "tune it".  It's best to use the WiFi interface to do it live and then update once its tuned.):
-static float i_limit_angle = 0.5f;      // Integrator saturation level
-static float i_limit_rate = 4.0f; // Integrator saturation level
-
-static float Kp_roll_angle = 3.0f;   // Roll P-gain
-static float Ki_roll_angle = 0.001f; // Roll I-gain
-
-static float Kp_pitch_angle = 3.0f;   // Pitch P-gain
-static float Ki_pitch_angle = 0.001f; // Pitch I-gain
-
-static float Kp_roll_rate = 0.0015f; // Roll P-gain
-static float Ki_roll_rate = 0.003f; // Roll I-gain
-static float Kd_roll_rate = 0.0f;   // Roll D-gain
-
-static float Kp_pitch_rate = 0.0015f; // Pitch P-gain
-static float Ki_pitch_rate = 0.003f; // Pitch I-gain
-static float Kd_pitch_rate = 0.0f;   // Pitch D-gain
-
-static float Kp_yaw_rate = 0.0015f; // Yaw P-gain default 30
-static float Ki_yaw_rate = 0.003f; // Yaw I-gain default 5
-static float Kd_yaw_rate = 0.0f;    // Yaw D-gain default .015 (be careful when increasing too high, motors will begin to overheat!)
+Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
+PIDConstants pid = {};
 
 // Instantiate per-axis limits (conservative values for 10" props)
 Limits rollLimits = {160.0f}; // maxRate, maxAccel, maxJerk
@@ -90,27 +51,13 @@ static float q3 = 0.0f;
 static unsigned long lastMadgwickUpdateMicros = 0;
 static float madDeltaTime = 1 / IMU_FREQ_HZ;
 
-// pin definition for PPM
-static const int stickRightHorizontal = 1; // right horizontal stick, roll
-static const int stickRightVertical = 2;   // right vertical stick, pitch
-static const int stickLeftVertical = 3;    // left vertical stick, throttle
-static const int stickLeftHorizontal = 4;  // left horizontal stick, yaw
-static const int SwitchA = 5;              // SWA switch, throttle cut
-static const int SwitchB = 6;              // SWB switch, failsafed
-// end of pin definition
-
-static const int throttlePin = stickLeftVertical; // throttle - up and down
-static const int rollPin = stickRightHorizontal;  // ail (roll)
-static const int pitchPin = stickRightVertical;  // elevation (pitch)
-static const int yawPin = stickLeftHorizontal;   // rudder (yaw)
-static const int throttleCutSwitchPin = SwitchA;  // throttle cut
-static const int failsafePin = SwitchB;           // Receiver failsafed - force a landing
+// Pin assignments
 static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
 static int16_t highestThrottlePWM = 1500;
 static int16_t lowestThrottlePWM = 2000;
-static float trimYaw = 0;
-static float trimPitch = 0;
-static float trimRoll = 0;
+
+// Pressure Sensor
+AltitudeData altitudeData{};
 
 // PPM variables
 static volatile byte state = LOW;
@@ -125,6 +72,10 @@ static volatile bool start = false;
 static int throttleCutCounter = 0;
 static int throttleNotCutCounter = 0;
 
+static float trimYaw = 0;
+static float trimPitch = 0;
+static float trimRoll = 0;
+
 static rmt_channel_handle_t rx_channel;
 
 // Motor Electronic Speed Control Modules (ESC):
@@ -133,9 +84,9 @@ mcpwm_cmpr_handle_t comparators[4];
 
 static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
+// GPS
 GPSData gps{};
 HomePosition homePos{};
-AltitudeData altitudeData{};
 
 // General stuff for controlling timing of things
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -207,11 +158,9 @@ static int batteryVoltage = 777;             // just a default for the battery m
 static unsigned long next_voltage_check = 0; // used in loopBuzzer to check for voltage on the main battery.
 static bool beeping = false;                 // For tracking beeping when the battery is getting low.
 static float calced_voltage = 14.8;
-// static unsigned long start_time;
+
 // WiFi Variables
 static WiFiServer server(80);
-
-// WiFi End
 
 //========================================================================================================================//
 // BEGIN THE CLASSIC SETUP AND LOOP
@@ -235,7 +184,7 @@ void setup()
   Serial.println("Waiting for Radio");
   playStartSong();
   // motorTest(); //Used to check rotation on the bench. NO PROPS!
-  if (!EASYCHAIR)
+  if (!BENCH_TESTING)
     waitForRadio();
   Serial.println("Ready...");
   if (altitudeData.hasBMP581) beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
@@ -438,7 +387,7 @@ void troubleShooting()
   //  printMotorCommands(); // Prints the values being written to the motors (expected: 1000 to 2000)
   //  printtock();      // Prints the time between loops in microseconds (expected: microseconds between inner loop iterations.  Set by DEFINES's)
   //  printGPS();
-  #if EASYCHAIR
+  #if BENCH_TESTING
     printJSON();
   #endif
   //  printJSON();
@@ -672,7 +621,7 @@ void waitForRadio()
   PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
   PWM_FailsafeSwitch = getRadioPWM(failsafePin, 1000);
 
-  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1519 || PWM_ThrottleCutSwitch > 1500 || PWM_FailsafeSwitch < 1500) && !EASYCHAIR)
+  while ((PWM_throttle_prev < 1400 || PWM_throttle_prev > 1519 || PWM_ThrottleCutSwitch > 1500 || PWM_FailsafeSwitch < 1500) && !BENCH_TESTING)
   { // Throttle Cut switch pulled down (flymode) is 2000. Up is 1000 (cut)
     // if the throttle is up or the cut switch is set to Fly (pulled down), then wait until the switches are set.
     PWM_throttle_prev = getRadioPWM(throttlePin, 1520);              // keep it stuck in the loop if it failsafes
@@ -1311,32 +1260,32 @@ void PIDControlCalcs()
   // --- Roll ---
   float rateErrorRoll = desiredRateRoll - p;
   integral_rate_roll += rateErrorRoll * madDeltaTime;
-  integral_rate_roll = constrain(integral_rate_roll, -i_limit_rate, i_limit_rate); // Think of this as the tracked energy required to achieve motor torque
+  integral_rate_roll = constrain(integral_rate_roll, -pid.i_limit_rate, pid.i_limit_rate); // Think of this as the tracked energy required to achieve motor torque
 
   float derivative_roll = p;
-  roll_PID = Kp_roll_rate * rateErrorRoll +
-             Ki_roll_rate * integral_rate_roll -
-             Kd_roll_rate * derivative_roll;
+  roll_PID = pid.Kp_roll_rate * rateErrorRoll +
+             pid.Ki_roll_rate * integral_rate_roll -
+             pid.Kd_roll_rate * derivative_roll;
 
   // --- Pitch ---
   float rateErrorPitch = desiredRatePitch - q;
   integral_rate_pitch += rateErrorPitch * madDeltaTime;
-  integral_rate_pitch = constrain(integral_rate_pitch, -i_limit_rate, i_limit_rate);
+  integral_rate_pitch = constrain(integral_rate_pitch, -pid.i_limit_rate, pid.i_limit_rate);
 
   float derivative_pitch = q;
-  pitch_PID = Kp_pitch_rate * rateErrorPitch +
-              Ki_pitch_rate * integral_rate_pitch -
-              Kd_pitch_rate * derivative_pitch;
+  pitch_PID = pid.Kp_pitch_rate * rateErrorPitch +
+              pid.Ki_pitch_rate * integral_rate_pitch -
+              pid.Kd_pitch_rate * derivative_pitch;
 
   // --- Yaw ---
   float rateErrorYaw = yaw_des - r;
   integral_rate_yaw += rateErrorYaw * madDeltaTime;
-  integral_rate_yaw = constrain(integral_rate_yaw, -i_limit_rate, i_limit_rate);
+  integral_rate_yaw = constrain(integral_rate_yaw, -pid.i_limit_rate, pid.i_limit_rate);
 
   float derivative_yaw = r;
-  yaw_PID = Kp_yaw_rate * rateErrorYaw +
-            Ki_yaw_rate * integral_rate_yaw -
-            Kd_yaw_rate * derivative_yaw;
+  yaw_PID = pid.Kp_yaw_rate * rateErrorYaw +
+            pid.Ki_yaw_rate * integral_rate_yaw -
+            pid.Kd_yaw_rate * derivative_yaw;
 }
 
 void AngleLoopCalcs()
@@ -1354,19 +1303,19 @@ void AngleLoopCalcs()
   // --- Roll ---
   float angleErrorRoll = roll_des - roll_IMU;
   integral_roll += angleErrorRoll * dt;
-  integral_roll = constrain(integral_roll, -i_limit_angle, i_limit_angle);
+  integral_roll = constrain(integral_roll, -pid.i_limit_angle, pid.i_limit_angle);
 
-  desiredRateRoll = Kp_roll_angle * angleErrorRoll +
-                    Ki_roll_angle * integral_roll;
+  desiredRateRoll = pid.Kp_roll_angle * angleErrorRoll +
+                    pid.Ki_roll_angle * integral_roll;
   desiredRateRoll = constrain(desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
 
   // --- Pitch ---
   float angleErrorPitch = pitch_des - pitch_IMU;
   integral_pitch += angleErrorPitch * dt;
-  integral_pitch = constrain(integral_pitch, -i_limit_angle, i_limit_angle);
+  integral_pitch = constrain(integral_pitch, -pid.i_limit_angle, pid.i_limit_angle);
 
-  desiredRatePitch = Kp_pitch_angle * angleErrorPitch +
-                     Ki_pitch_angle * integral_pitch;
+  desiredRatePitch = pid.Kp_pitch_angle * angleErrorPitch +
+                     pid.Ki_pitch_angle * integral_pitch;
   desiredRatePitch = constrain(desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
 
   // --- Yaw setpoint comes directly from the stick --- //
@@ -1594,7 +1543,7 @@ inline void motorPipeline()
 
 inline void commandMotors()
 {
-    if (EASYCHAIR)
+    if (BENCH_TESTING)
     {
       mcpwm_comparator_set_compare_value(comparators[0], 1000);
       mcpwm_comparator_set_compare_value(comparators[1], 1000);
@@ -1711,7 +1660,7 @@ void throttleCut()
   }
 
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
-  if (PWM_throttle<1600&&!EASYCHAIR)
+  if (PWM_throttle<1600&&!BENCH_TESTING)
   {
     if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
     {
@@ -1722,7 +1671,7 @@ void throttleCut()
 
   if (altitudeData.hasBMP581)
   {
-    if (!flying && altitudeData.altitude < 2 && !EASYCHAIR) // this is tip over protection at take-off
+    if (!flying && altitudeData.altitude < 2 && !BENCH_TESTING) // this is tip over protection at take-off
     {
       if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
       {
@@ -2028,7 +1977,7 @@ int16_t getRadioPWM(int ch_num, int16_t defaultVal)
   return valPWM;
 }
 
-inline int16_t latestValidChannelValue(int channel, int16_t defaultValue) {
+inline int16_t latestValidChannelValue(uint8_t  channel, int16_t defaultValue) {
   // Capture current time once
   unsigned long currentMicros = micros();
 
@@ -2182,9 +2131,9 @@ void loopWiFi()
   // --- Default page (redirect everything else) ---
   else
   {
-    if (EASYCHAIR) Serial.println("Generating the page...");
+    if (BENCH_TESTING) Serial.println("Generating the page...");
     GenerateDefaultPage(client);
-    if (EASYCHAIR) Serial.println("Served the page.");
+    if (BENCH_TESTING) Serial.println("Served the page.");
   }
 
   client.stop();
@@ -2197,10 +2146,10 @@ void setValuesFromUserForm(String req)
 
   int qIndex = req.indexOf('?');
   int hIndex = req.indexOf("HTTP");
-  if (EASYCHAIR) Serial.print("qIndex: ");
-  if (EASYCHAIR) Serial.println(String(qIndex));
-  if (EASYCHAIR) Serial.print(" hIndex: ");
-  if (EASYCHAIR) Serial.println(String(hIndex));
+  if (BENCH_TESTING) Serial.print("qIndex: ");
+  if (BENCH_TESTING) Serial.println(String(qIndex));
+  if (BENCH_TESTING) Serial.print(" hIndex: ");
+  if (BENCH_TESTING) Serial.println(String(hIndex));
   if (qIndex == -1 || hIndex == -1)
     return;
 
@@ -2228,9 +2177,9 @@ void setValuesFromUserForm(String req)
     if (key == "stick_dampener")
       stick_dampener = value.toFloat();
     else if (key == "i_limit_rate")
-      i_limit_rate = value.toFloat();
+      pid.i_limit_rate = value.toFloat();
     else if (key == "i_limit_angle")
-      i_limit_angle = value.toFloat();
+      pid.i_limit_angle = value.toFloat();
     else if (key == "Accel_filter")
       Accel_filter = value.toFloat();
     else if (key == "Gyro_filter")
@@ -2238,31 +2187,31 @@ void setValuesFromUserForm(String req)
     else if (key == "B_madgwick")
       B_madgwick = value.toFloat();
     else if (key == "kp_roll_angle")
-      Kp_roll_angle = value.toFloat();
+      pid.Kp_roll_angle = value.toFloat();
     else if (key == "ki_roll_angle")
-      Ki_roll_angle = value.toFloat();
+      pid.Ki_roll_angle = value.toFloat();
     else if (key == "kp_pitch_angle")
-      Kp_pitch_angle = value.toFloat();
+      pid.Kp_pitch_angle = value.toFloat();
     else if (key == "ki_pitch_angle")
-      Ki_pitch_angle = value.toFloat();
+      pid.Ki_pitch_angle = value.toFloat();
     else if (key == "kp_roll_rate")
-      Kp_roll_rate = value.toFloat();
+      pid.Kp_roll_rate = value.toFloat();
     else if (key == "ki_roll_rate")
-      Ki_roll_rate = value.toFloat();
+      pid.Ki_roll_rate = value.toFloat();
     else if (key == "kd_roll_rate")
-      Kd_roll_rate = value.toFloat();
+      pid.Kd_roll_rate = value.toFloat();
     else if (key == "kp_pitch_rate")
-      Kp_pitch_rate = value.toFloat();
+      pid.Kp_pitch_rate = value.toFloat();
     else if (key == "ki_pitch_rate")
-      Ki_pitch_rate = value.toFloat();
+      pid.Ki_pitch_rate = value.toFloat();
     else if (key == "kd_pitch_rate")
-      Kd_pitch_rate = value.toFloat();
+      pid.Kd_pitch_rate = value.toFloat();
     else if (key == "kp_yaw_rate")
-      Kp_yaw_rate = value.toFloat();
+      pid.Kp_yaw_rate = value.toFloat();
     else if (key == "ki_yaw_rate")
-      Ki_yaw_rate = value.toFloat();
+      pid.Ki_yaw_rate = value.toFloat();
     else if (key == "kd_yaw_rate")
-      Kd_yaw_rate = value.toFloat();
+      pid.Kd_yaw_rate = value.toFloat();
     else if (key == "maxRoll")
     {
       maxRoll = value.toFloat();
@@ -2402,21 +2351,21 @@ void saveParameters()
   prefs.putFloat("trimRoll", trimRoll);
   prefs.putFloat("trimYaw", trimYaw);
   prefs.putFloat("stick_dampener", stick_dampener);
-  prefs.putFloat("i_limit_angle", i_limit_angle);
-  prefs.putFloat("i_limit_rate", i_limit_rate);
+  prefs.putFloat("i_limit_angle", pid.i_limit_angle);
+  prefs.putFloat("i_limit_rate", pid.i_limit_rate);
   prefs.putFloat("B_madgwick", B_madgwick);
   prefs.putFloat("Accel_filter", Accel_filter);
   prefs.putFloat("Gyro_filter", Gyro_filter);
-  prefs.putFloat("Kp_roll_rate", Kp_roll_rate);
-  prefs.putFloat("Ki_roll_rate", Ki_roll_rate);
-  prefs.putFloat("Kd_roll_rate", Kd_roll_rate);
-  prefs.putFloat("Kp_roll_angle", Kp_roll_angle);
-  prefs.putFloat("Ki_roll_angle", Ki_roll_angle);
-  prefs.putFloat("Kp_pitch_rate", Kp_pitch_rate);
-  prefs.putFloat("Ki_pitch_rate", Ki_pitch_rate);
-  prefs.putFloat("Kd_pitch_rate", Kd_pitch_rate);
-  prefs.putFloat("Kp_pitch_angle", Kp_pitch_angle);
-  prefs.putFloat("Ki_pitch_angle", Ki_pitch_angle);
+  prefs.putFloat("Kp_roll_rate", pid.Kp_roll_rate);
+  prefs.putFloat("Ki_roll_rate", pid.Ki_roll_rate);
+  prefs.putFloat("Kd_roll_rate", pid.Kd_roll_rate);
+  prefs.putFloat("Kp_roll_angle", pid.Kp_roll_angle);
+  prefs.putFloat("Ki_roll_angle", pid.Ki_roll_angle);
+  prefs.putFloat("Kp_pitch_rate", pid.Kp_pitch_rate);
+  prefs.putFloat("Ki_pitch_rate", pid.Ki_pitch_rate);
+  prefs.putFloat("Kd_pitch_rate", pid.Kd_pitch_rate);
+  prefs.putFloat("Kp_pitch_angle", pid.Kp_pitch_angle);
+  prefs.putFloat("Ki_pitch_angle", pid.Ki_pitch_angle);
   prefs.putFloat("roll_maxRate", rollLimits.maxRate);
   prefs.putFloat("pitch_maxRate", pitchLimits.maxRate);
   prefs.putFloat("maxRoll",maxRoll);
@@ -2424,11 +2373,11 @@ void saveParameters()
   prefs.putInt("rateControlMode", rateControlMode);
   prefs.putFloat("maxYaw",maxYaw);
   prefs.putFloat("K_pos2pwm", K_pos2pwm);
-  prefs.putFloat("Kp_yaw_rate", Kp_yaw_rate);
-  prefs.putFloat("Ki_yaw_rate", Ki_yaw_rate);
-  prefs.putFloat("Kd_yaw_rate", Kd_yaw_rate);
+  prefs.putFloat("Kp_yaw_rate", pid.Kp_yaw_rate);
+  prefs.putFloat("Ki_yaw_rate", pid.Ki_yaw_rate);
+  prefs.putFloat("Kd_yaw_rate", pid.Kd_yaw_rate);
   prefs.end(); // close namespace
-  if (EASYCHAIR) Serial.println("Free entries: " + String(prefs.freeEntries()));
+  if (BENCH_TESTING) Serial.println("Free entries: " + String(prefs.freeEntries()));
 }
 
 void loadParameters()
@@ -2451,22 +2400,22 @@ void loadParameters()
   DOWN_COEFF = prefs.getFloat("DOWN_COEFF", DOWN_COEFF);
   failsafeCoeff = prefs.getFloat("failsafeCoeff", failsafeCoeff);
   stick_dampener = prefs.getFloat("stick_dampener", stick_dampener);
-  i_limit_angle = prefs.getFloat("i_limit_angle", i_limit_angle);
-  i_limit_rate = prefs.getFloat("i_limit_rate", i_limit_rate);
+  pid.i_limit_angle = prefs.getFloat("i_limit_angle", pid.i_limit_angle);
+  pid.i_limit_rate = prefs.getFloat("i_limit_rate", pid.i_limit_rate);
   B_madgwick = prefs.getFloat("B_madgwick", B_madgwick);
   Accel_filter = prefs.getFloat("Accel_filter", Accel_filter);
   Gyro_filter = prefs.getFloat("Gyro_filter", Gyro_filter);
 
-  Kp_roll_rate = prefs.getFloat("Kp_roll_rate", Kp_roll_rate);
-  Ki_roll_rate = prefs.getFloat("Ki_roll_rate", Ki_roll_rate);
-  Kd_roll_rate = prefs.getFloat("Kd_roll_rate", Kd_roll_rate);
-  Kp_roll_angle = prefs.getFloat("Kp_roll_angle", Kp_roll_angle);
-  Ki_roll_angle = prefs.getFloat("Ki_roll_angle", Ki_roll_angle);
-  Kp_pitch_rate = prefs.getFloat("Kp_pitch_rate", Kp_pitch_rate);
-  Ki_pitch_rate = prefs.getFloat("Ki_pitch_rate", Ki_pitch_rate);
-  Kd_pitch_rate = prefs.getFloat("Kd_pitch_rate", Kd_pitch_rate);
-  Kp_pitch_angle = prefs.getFloat("Kp_pitch_angle", Kp_pitch_angle);
-  Ki_pitch_angle = prefs.getFloat("Ki_pitch_angle", Ki_pitch_angle);
+  pid.Kp_roll_rate = prefs.getFloat("Kp_roll_rate", pid.Kp_roll_rate);
+  pid.Ki_roll_rate = prefs.getFloat("Ki_roll_rate", pid.Ki_roll_rate);
+  pid.Kd_roll_rate = prefs.getFloat("Kd_roll_rate", pid.Kd_roll_rate);
+  pid.Kp_roll_angle = prefs.getFloat("Kp_roll_angle", pid.Kp_roll_angle);
+  pid.Ki_roll_angle = prefs.getFloat("Ki_roll_angle", pid.Ki_roll_angle);
+  pid.Kp_pitch_rate = prefs.getFloat("Kp_pitch_rate", pid.Kp_pitch_rate);
+  pid.Ki_pitch_rate = prefs.getFloat("Ki_pitch_rate", pid.Ki_pitch_rate);
+  pid.Kd_pitch_rate = prefs.getFloat("Kd_pitch_rate", pid.Kd_pitch_rate);
+  pid.Kp_pitch_angle = prefs.getFloat("Kp_pitch_angle", pid.Kp_pitch_angle);
+  pid.Ki_pitch_angle = prefs.getFloat("Ki_pitch_angle", pid.Ki_pitch_angle);
 
   rollLimits.maxRate = prefs.getFloat("roll_maxRate", rollLimits.maxRate);
   pitchLimits.maxRate = prefs.getFloat("pitch_maxRate", pitchLimits.maxRate);
@@ -2477,17 +2426,17 @@ void loadParameters()
   maxPitch = constrain(maxPitch, 5, 70);
   maxYaw = prefs.getFloat("maxYaw", maxYaw);
   K_pos2pwm = prefs.getFloat("K_pos2pwm", K_pos2pwm);
-  Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", Kp_yaw_rate);
-  Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", Ki_yaw_rate);
-  Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", Kd_yaw_rate);
+  pid.Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", pid.Kp_yaw_rate);
+  pid.Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", pid.Ki_yaw_rate);
+  pid.Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", pid.Kd_yaw_rate);
 
   prefs.end();
-  if (EASYCHAIR) Serial.println("Parameters loaded from NVS (or defaults if none stored).");
+  if (BENCH_TESTING) Serial.println("Parameters loaded from NVS (or defaults if none stored).");
 }
 
 void GenerateDefaultPage(WiFiClient &client) 
 { 
-  if (EASYCHAIR) Serial.println("About to MakeWebPage.");
+  if (BENCH_TESTING) Serial.println("About to MakeWebPage.");
   // Build HTML body first (so we can compute Content-Length)
   String body; 
   body.reserve(8192); 
@@ -2531,25 +2480,25 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<table class=table><thead class=thead-dark><th></th><th>Kp</th><th>Ki</th><th>Kd</th></thead>";
   // Roll row 
   body += "<tr><td>Roll Angle:</td><td><input name=kp_roll_angle style='width:80px;' type=number step=.0001 value='" +
-  String(Kp_roll_angle, 4) + "'></td><td><input name=ki_roll_angle style='width:80px;' type=number step=.0001 value='" +
-  String(Ki_roll_angle, 4) + "'></td></tr>";
+  String(pid.Kp_roll_angle, 4) + "'></td><td><input name=ki_roll_angle style='width:80px;' type=number step=.0001 value='" +
+  String(pid.Ki_roll_angle, 4) + "'></td></tr>";
   body += "<tr><td>Roll Rate:</td><td><input name=kp_roll_rate style='width:80px;' type=number step=.0001 value='" +
-  String(Kp_roll_rate, 4) + "'></td><td><input style='width:80px;' name=ki_roll_rate type=number step=.0001 value='" +
-  String(Ki_roll_rate, 4) + "'></td><td><input name=kd_roll_rate type=number step=.00001 style='width:100px;' value='" +
-  String(Kd_roll_rate, 5) + "'></td></tr>";
+  String(pid.Kp_roll_rate, 4) + "'></td><td><input style='width:80px;' name=ki_roll_rate type=number step=.0001 value='" +
+  String(pid.Ki_roll_rate, 4) + "'></td><td><input name=kd_roll_rate type=number step=.00001 style='width:100px;' value='" +
+  String(pid.Kd_roll_rate, 5) + "'></td></tr>";
   // Pitch row 
   body += "<tr><td>Pitch Angle:</td><td><input name=kp_pitch_angle style='width:80px;' type=number step=.0001 value='" +
-  String(Kp_pitch_angle, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_angle type=number step=.0001 value='" +
-  String(Ki_pitch_angle, 4) + "'></td></tr>";
+  String(pid.Kp_pitch_angle, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_angle type=number step=.0001 value='" +
+  String(pid.Ki_pitch_angle, 4) + "'></td></tr>";
   body += "<tr><td>Pitch Rate:</td><td><input name=kp_pitch_rate style='width:80px;' type=number step=.0001 value='" +
-  String(Kp_pitch_rate, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_rate type=number step=.0001 value='" +
-  String(Ki_pitch_rate, 4) + "'></td><td><input name=kd_pitch_rate type=number step=.00001 style='width:100px;' value='" +
-  String(Kd_pitch_rate, 5) + "'></td></tr>";
+  String(pid.Kp_pitch_rate, 4) + "'></td><td><input style='width:80px;' name=ki_pitch_rate type=number step=.0001 value='" +
+  String(pid.Ki_pitch_rate, 4) + "'></td><td><input name=kd_pitch_rate type=number step=.00001 style='width:100px;' value='" +
+  String(pid.Kd_pitch_rate, 5) + "'></td></tr>";
   // Yaw row
   body += "<tr><td>Yaw Rate:</td><td><input name=kp_yaw_rate type=number step=0.0001 style='width:80px;' value='" +
-  String(Kp_yaw_rate, 4) + "'></td><td><input style='width:80px;' type=number step=.0001 name=ki_yaw_rate value='" +
-  String(Ki_yaw_rate, 4) + "'></td><td><input type=number step=.00001 name=kd_yaw_rate style='width:100px;' value='" +
-  String(Kd_yaw_rate, 5) + "'></td></tr>";
+  String(pid.Kp_yaw_rate, 4) + "'></td><td><input style='width:80px;' type=number step=.0001 name=ki_yaw_rate value='" +
+  String(pid.Ki_yaw_rate, 4) + "'></td><td><input type=number step=.00001 name=kd_yaw_rate style='width:100px;' value='" +
+  String(pid.Kd_yaw_rate, 5) + "'></td></tr>";
   // Integral limit row
   body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit_angle style='width:90px;' value='" + String(i_limit_angle) + "'></td>";
   body += "<td>Rate Integral Max:</td><td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" + String(i_limit_rate) + "'></td></tr>";
@@ -2621,7 +2570,7 @@ void GenerateDefaultPage(WiFiClient &client)
   // Send headers + body in one go 
   client.write((const uint8_t *)headers.c_str(), headers.length());
   client.write((const uint8_t *)body.c_str(), body.length());  
-  if (EASYCHAIR) Serial.println("Made Web Page.");
+  if (BENCH_TESTING) Serial.println("Made Web Page.");
 }
 
 /*
