@@ -75,6 +75,9 @@ constexpr uint8_t BATTERY_PIN = 26;        // GPIO26, Pin 26 - not actually an a
 constexpr uint8_t IMU_INT_PIN = 7; // GPIO7 (pin 11 on ESP32-S3 MINI)
 constexpr uint8_t ACCEL_DATA_X1 = 0x1F;
 constexpr uint8_t GYRO_DATA_X1 = 0x25;
+constexpr float G_PER_LSB = 1.0f / 2048.0f; // ACCEL_FS_SEL = 1, ±16 g, Page 11 of IMU-icm-40609-d_v1.2.pdf
+constexpr float DPS_PER_LSB = 1.0f / 32.8f; // GYRO_FS_SEL = 1, ±1000 dps, Page 10 of IMU-icm-40609-d_v1.2.pdf
+constexpr float USEC_TO_SEC = 1.0f / 1000000.0f;
 
 // SPI setup
 constexpr uint8_t SPI_SCLK = 12;

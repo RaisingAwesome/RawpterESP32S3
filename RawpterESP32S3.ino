@@ -14,29 +14,15 @@ Preferences prefs; // Stores key flight controller configuration to ESP32S3 onbo
 PIDConstants pid{};
 AltitudeData altitudeData{};
 GPSData gps{};
-HomePosition homePos{};
-
-// Instantiate per-axis limits (conservative values for 10" props)
+RmtPPMReader radio;
+WiFiServer server(80);
+ConfigData configData{};
 Limits rollLimits = {160.0f}; 
 Limits pitchLimits = {160.0f};
 
 static float desiredRateRoll, desiredRatePitch;
 
-// Radio failsafe values for every channel in the event that bad reciever data is detected.
-// These are for it to stay stable and descend safely versus totally cutting throttle and drop like a rock.
-static float stick_dampener = 1.0f;             // 0.1-1 Lower=slower, higher=noiser default 0.7
-static float throttleLimit = 0.6f;              // can be overridden with web interface.
-static bool failsafed = false;
-static bool failsafeTriggered = false;
-static unsigned long failsafeTime = 0;
-static bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
-static float UP_COEFF = 0.01f;                                       // 0.0 - 1.0 (0 is slower up, 1 is faster up)
-static float DOWN_COEFF = 0.03f;                                    // 0.0 - 1.0 (0 is slower down, 1 is faster down)
-static float failsafeCoeff = .00001f;                               // 0.0001 - 0.03 (slow to fast)
-static int16_t failsafeThrottlePWM = 1650;        // A safe throttle for descent.
-
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
-static float B_madgwick = 0.02f;
 static float recipNorm;
 static float s0, s1, s2, s3;
 static float qDot1, qDot2, qDot3, qDot4;
@@ -52,25 +38,6 @@ static float madDeltaTime = 1 / IMU_FREQ_HZ;
 static int16_t highestThrottlePWM = 1500;
 static int16_t lowestThrottlePWM = 2000;
 
-// PPM variables
-static volatile byte state = LOW;
-static volatile byte previous_state = LOW;
-static volatile unsigned long microsAtLastPulse = 0;
-static unsigned minChannelPWMValue = 900;       // Used to determine if a channels reported pulse width is realistically valid.
-static unsigned maxChannelPWMValue = 2100;      // Used to determine if a channels reported pulse width is realistically valid.
-static unsigned long failsafeTimeout = 500000L; // The timeout (microseconds) after which the channels which were not updated are considered invalid
-RmtPPMReader radio;
-
-static volatile bool start = false;
-static int throttleCutCounter = 0;
-static int throttleNotCutCounter = 0;
-
-static float trimYaw = 0;
-static float trimPitch = 0;
-static float trimRoll = 0;
-
-static rmt_channel_handle_t rx_channel;
-
 // Motor Electronic Speed Control Modules (ESC):
 const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
 mcpwm_cmpr_handle_t comparators[4];
@@ -85,12 +52,14 @@ static volatile unsigned long debugger;
 static bool flying = false;
 static bool playingSong = false;
 TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop task that will run on its own core.
-static bool rateControlMode = false;
 
 // Radio communication:
 static int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
 static int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
-
+static bool failsafed = false;
+unsigned long failsafeTime = 0;
+bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
+  
 // IMU:
 static float AccX, AccY, AccZ;
 static float AccX_prev, AccY_prev, AccZ_prev;
@@ -98,13 +67,7 @@ static float GyroX, GyroY, GyroZ;
 static float GyroX_prev, GyroY_prev, GyroZ_prev;
 static float roll_IMU, pitch_IMU, yaw_IMU;
 static float roll_IMU_prev, pitch_IMU_prev;
-static float K_pos2pwm = 50.0f;  // tune
-constexpr float G_PER_LSB = 1.0f / 2048.0f; // ACCEL_FS_SEL = 1, ±16 g, Page 11 of IMU-icm-40609-d_v1.2.pdf
-constexpr float DPS_PER_LSB = 1.0f / 32.8f; // GYRO_FS_SEL = 1, ±1000 dps, Page 10 of IMU-icm-40609-d_v1.2.pdf
-constexpr float USEC_TO_SEC = 1.0f / 1000000.0f;
-static float maxRoll = 35.0f;  // Max roll angle in degrees the sticks can achieve
-static float maxPitch = 35.0f; // Max pitch angle in degrees the sticks can achieve
-static float maxYaw = 160.0f;  // Max yaw rate in deg/sec (default 160.0)
+
 
 // GPS Flight Controller
 static float AccErrorX = 0.03;
@@ -123,9 +86,6 @@ static float GyroErrorZ = 0.55;
 */
 
 static SPIClass IMUSPI(HSPI);
-
-static float Gyro_filter = 0.9f;  // Lower is slower to catch up. Higher is faster to track, but can have a lot of noise. 1 is no filter
-static float Accel_filter = 0.9f; // Lower is slower to catch up. Higher is faster to track, but can have a lot of noise. 1 is no filter
 
 // PID Controller:
 static float throttle_desired, roll_des, pitch_des, yaw_des; // Normalized desired state
@@ -147,9 +107,6 @@ static unsigned long next_voltage_check = 0; // used in loopBuzzer to check for 
 static bool beeping = false;                 // For tracking beeping when the battery is getting low.
 static float calced_voltage = 14.8;
 
-// WiFi Variables
-static WiFiServer server(80);
-
 //========================================================================================================================//
 // BEGIN THE CLASSIC SETUP AND LOOP
 //========================================================================================================================//
@@ -169,37 +126,27 @@ void setup()
   setupPressureSensor();     // Gets some default info and ensures their is a working BMP581 on board
   setupIMU();                // Ensures there is a working IMU on board - it's imperative.
   //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
-  Serial.println("Waiting for Radio");
+  
   playStartSong();
   // motorTest(); //Used to check rotation on the bench. NO PROPS!
   if (!BENCH_TESTING)
+  {
+    Serial.println("Waiting for Radio");
     waitForRadio();
-  Serial.println("Ready...");
+  }
+    Serial.println("Ready...");
   if (altitudeData.hasBMP581) beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
-  //start_time = micros();
 }
 
 void loop()
 {
-  //String times="";
   tick();
   syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
   getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
   getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
-  //float temp = (micros()-tick_time);
-  //times ="\t" + String(temp,1);//331, 291
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
-  //temp = (micros()-tick_time);
-  //times += "\t" + String(temp,1);//377, 350
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
-  //temp = (micros()-tick_time);
-  //times += "\t" + String(temp,1);//395, 371
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
-  //temp = (micros()-tick_time);
-  //times +="\t" + String(temp,1);//412, 463
-  //temp = (micros()-start_time)*.000001f;
-  //times += "\t" + String(temp,3);
-  //Serial.println(times);
   tock();                                   // Yields until the end of the the inner loop pacing
   troubleShooting();
 }
@@ -241,7 +188,7 @@ void beginAltitudeTask()
   // on its own core.
   xTaskCreatePinnedToCore(
       bmpAndgpsTask,               // Task function
-      "BMP581 Task",               // Name
+      "BMP and GPS Task",          // Name
       4096,                        // Stack size (bytes)
       NULL,                        // Parameters
       1,                           // Priority (Highest priority on core)
@@ -268,7 +215,7 @@ void bmpAndgpsTask(void *pvParameters)
         gps.latitudeWorking =  gps.Max10SGPS.getLatitude() / 1e7;
         gps.longitudeWorking = gps.Max10SGPS.getLongitude() / 1e7;
         gps.fixType = gps.Max10SGPS.getFixType();
-        if (homePos.valid && gps.fixType >= 3) gps.useGPS = true;
+        if (gps.homeValid && gps.fixType >= 3) gps.useGPS = true;
         else gps.useGPS = false; 
       }
     }
@@ -1423,9 +1370,9 @@ inline void getRadioStickValues()
     PWM_throttle = 1500;
 
   // Stick dampening (optimized form)
-  PWM_roll = PWM_roll_prev + stick_dampener * (PWM_roll - PWM_roll_prev);
-  PWM_pitch = PWM_pitch_prev + stick_dampener * (PWM_pitch - PWM_pitch_prev);
-  PWM_yaw = PWM_yaw_prev + stick_dampener * (PWM_yaw - PWM_yaw_prev);
+  PWM_roll = PWM_roll_prev + configData.stick_dampener * (PWM_roll - PWM_roll_prev);
+  PWM_pitch = PWM_pitch_prev + configData.stick_dampener * (PWM_pitch - PWM_pitch_prev);
+  PWM_yaw = PWM_yaw_prev + configData.stick_dampener * (PWM_yaw - PWM_yaw_prev);
 
   // Update prevs
   PWM_throttle_prev = PWM_throttle;
@@ -1442,7 +1389,7 @@ inline void headHome()
         float errN, errE;
 
         gpsErrorToNE(gps.latitude, gps.longitude,
-                     homePos.lat_deg, homePos.lon_deg,
+                     gps.homePosLatitude, gps.homePosLongitude,
                      errN, errE);
 
         float dist2 = errN*errN + errE*errE;
@@ -1553,10 +1500,10 @@ inline void scaleMotorCommandsToPWM()
   // The actual pulse frame is set at the setupMotorCommunication.
   //
   // Scale to Servo PWM 1000-2000 microseconds for stop to full speed.  No need to constrain since mx_command_scaled already is.
-  m1_command_PWM = throttleLimit * m1_command_scaled * 1000 + 1000;
-  m2_command_PWM = throttleLimit * m2_command_scaled * 1000 + 1000;
-  m3_command_PWM = throttleLimit * m3_command_scaled * 1000 + 1000;
-  m4_command_PWM = throttleLimit * m4_command_scaled * 1000 + 1000;
+  m1_command_PWM = configData.throttleLimit * m1_command_scaled * 1000 + 1000;
+  m2_command_PWM = configData.throttleLimit * m2_command_scaled * 1000 + 1000;
+  m3_command_PWM = configData.throttleLimit * m3_command_scaled * 1000 + 1000;
+  m4_command_PWM = configData.throttleLimit * m4_command_scaled * 1000 + 1000;
 }
 /*
 inline void calibrateESCs()
@@ -1600,6 +1547,8 @@ void throttleCut()
    * called before commandMotors() is called so that the last thing checked is if the user is giving permission to command
    * the motors to anything other than minimum value. Safety first.
    */
+  static int throttleCutCounter = 0;
+  static int throttleNotCutCounter = 0;
 
   if (throttle_is_cut)
   {
@@ -1677,11 +1626,11 @@ void setHome()
 {
   if (gps.hasGPS && gps.fixType >= 3)
   {
-      homePos.lat_deg = gps.latitude;
-      homePos.lon_deg = gps.longitude;
-      homePos.valid = true;
+      gps.homePosLatitude = gps.latitude;
+      gps.homePosLongitude = gps.longitude;
+      gps.homeValid = true;
   } else {
-      homePos.valid = false;
+      gps.homeValid = false;
   }
 }
 
@@ -1967,6 +1916,10 @@ int16_t getRadioPWM(int ch_num, int16_t defaultVal)
 
 inline int16_t latestValidChannelValue(uint8_t  channel, int16_t defaultValue) {
   // Capture current time once
+  static unsigned minChannelPWMValue = 900;       // Used to determine if a channels reported pulse width is realistically valid.
+  static unsigned maxChannelPWMValue = 2100;      // Used to determine if a channels reported pulse width is realistically valid.
+  static unsigned long failsafeTimeout = 500000L; // The timeout (microseconds) after which the channels which were not updated are considered invalid
+  static bool failsafeTriggered = false;
   unsigned long currentMicros = micros();
 
   int16_t value = defaultValue;
@@ -2163,7 +2116,7 @@ void setValuesFromUserForm(String req)
 
     // Assign values
     if (key == "stick_dampener")
-      stick_dampener = value.toFloat();
+      configData.stick_dampener = value.toFloat();
     else if (key == "i_limit_rate")
       pid.i_limit_rate = value.toFloat();
     else if (key == "i_limit_angle")
@@ -2238,23 +2191,23 @@ void setValuesFromUserForm(String req)
       trimRoll = value.toFloat();
     else if (key =="throttleLimit")
     {
-      throttleLimit = value.toFloat();
-      throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
+      configData.throttleLimit = value.toFloat();
+      configData.throttleLimit = constrain(configData.throttleLimit,0.0,1.0); //protect from a fat finger
     }
     else if (key == "UP_COEFF")
     {
-      UP_COEFF = value.toFloat();
-      UP_COEFF = constrain(UP_COEFF, 0.0, 1.0);
+      configData.UP_COEFF = value.toFloat();
+      configData.UP_COEFF = constrain(configData.UP_COEFF, 0.0, 1.0);
     }
     else if (key == "failsafeCoeff")
     {
-      failsafeCoeff = value.toFloat();
-      failsafeCoeff = constrain(failsafeCoeff, 0.00001, 1.0);
+      configData.failsafeCoeff = value.toFloat();
+      configData.failsafeCoeff = constrain(configData.failsafeCoeff, 0.00001, 1.0);
     }
     else if (key == "DOWN_COEFF")
     {
-      DOWN_COEFF = value.toFloat();
-      DOWN_COEFF = constrain(DOWN_COEFF, 0.0, 1.0);
+      configData.DOWN_COEFF = value.toFloat();
+      configData.DOWN_COEFF = constrain(configData.DOWN_COEFF, 0.0, 1.0);
     }
     else if (key == "action")
     {
@@ -2320,30 +2273,30 @@ void writeRegister(uint8_t reg, uint8_t value)
 
 void saveParameters()
 {
-  throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
-  UP_COEFF = constrain(UP_COEFF,0.0,1.0); //protect from a fat finger
-  DOWN_COEFF = constrain(DOWN_COEFF,0.0,1.0); //protect from a fat finger
-  failsafeCoeff = constrain(failsafeCoeff, 0.00001,1.0);
+  configData.throttleLimit = constrain(configData.throttleLimit,0.0,1.0); //protect from a fat finger
+  configData.UP_COEFF = constrain(configData.UP_COEFF,0.0,1.0); //protect from a fat finger
+  configData.DOWN_COEFF = constrain(configData.DOWN_COEFF,0.0,1.0); //protect from a fat finger
+  configData.failsafeCoeff = constrain(configData.failsafeCoeff, 0.00001,1.0);
   prefs.begin("rawpter", false); // namespace "rawpter", RW mode
-  prefs.putInt("fsThrottlePWM", failsafeThrottlePWM);
+  prefs.putInt("fsThrottlePWM", configData.failsafeThrottlePWM);
   prefs.putFloat("ceiling", altitudeData.ceiling);
-  prefs.putFloat("throttleLimit", throttleLimit);
-  prefs.putFloat("UP_COEFF", UP_COEFF);
-  prefs.putFloat("DOWN_COEFF", DOWN_COEFF);
-  prefs.putFloat("failsafeCoeff", failsafeCoeff);
+  prefs.putFloat("throttleLimit", configData.throttleLimit);
+  prefs.putFloat("UP_COEFF", configData.UP_COEFF);
+  prefs.putFloat("DOWN_COEFF", configData.DOWN_COEFF);
+  prefs.putFloat("failsafeCoeff", configData.failsafeCoeff);
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("upGain" , altitudeData.upGain);
   prefs.putFloat("targetRateLanding", altitudeData.targetRateLanding);
-  prefs.putFloat("trimPitch", trimPitch);
-  prefs.putFloat("trimRoll", trimRoll);
-  prefs.putFloat("trimYaw", trimYaw);
-  prefs.putFloat("stick_dampener", stick_dampener);
+  prefs.putFloat("trimPitch", configData.trimPitch);
+  prefs.putFloat("trimRoll", configData.trimRoll);
+  prefs.putFloat("trimYaw", configData.trimYaw);
+  prefs.putFloat("stick_dampener", configData.stick_dampener);
   prefs.putFloat("i_limit_angle", pid.i_limit_angle);
   prefs.putFloat("i_limit_rate", pid.i_limit_rate);
-  prefs.putFloat("B_madgwick", B_madgwick);
-  prefs.putFloat("Accel_filter", Accel_filter);
-  prefs.putFloat("Gyro_filter", Gyro_filter);
+  prefs.putFloat("B_madgwick", configData.B_madgwick);
+  prefs.putFloat("Accel_filter", configData.Accel_filter);
+  prefs.putFloat("Gyro_filter", configData.Gyro_filter);
   prefs.putFloat("Kp_roll_rate", pid.Kp_roll_rate);
   prefs.putFloat("Ki_roll_rate", pid.Ki_roll_rate);
   prefs.putFloat("Kd_roll_rate", pid.Kd_roll_rate);
@@ -2356,11 +2309,11 @@ void saveParameters()
   prefs.putFloat("Ki_pitch_angle", pid.Ki_pitch_angle);
   prefs.putFloat("roll_maxRate", rollLimits.maxRate);
   prefs.putFloat("pitch_maxRate", pitchLimits.maxRate);
-  prefs.putFloat("maxRoll",maxRoll);
-  prefs.putFloat("maxPitch",maxPitch);
-  prefs.putInt("rateControlMode", rateControlMode);
-  prefs.putFloat("maxYaw",maxYaw);
-  prefs.putFloat("K_pos2pwm", K_pos2pwm);
+  prefs.putFloat("maxRoll", configData.maxRoll);
+  prefs.putFloat("maxPitch", configData.maxPitch);
+  prefs.putInt("rateControlMode", configData.rateControlMode);
+  prefs.putFloat("maxYaw", configData.maxYaw);
+  prefs.putFloat("K_pos2pwm", configData.K_pos2pwm);
   prefs.putFloat("Kp_yaw_rate", pid.Kp_yaw_rate);
   prefs.putFloat("Ki_yaw_rate", pid.Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", pid.Kd_yaw_rate);
@@ -2373,26 +2326,26 @@ void loadParameters()
   prefs.begin("rawpter", true); // namespace "rawpter", read-only
 
   // Use current variable values as defaults
-  failsafeThrottlePWM = prefs.getInt("fsThrottlePWM", failsafeThrottlePWM);
+  configData.failsafeThrottlePWM = prefs.getInt("fsThrottlePWM", configData.failsafeThrottlePWM);
   altitudeData.kp_altitude_rate = prefs.getFloat("kpaltrate", altitudeData.kp_altitude_rate);
   altitudeData.ki_altitude_rate = prefs.getFloat("kialtrate", altitudeData.ki_altitude_rate);
   altitudeData.targetRateLanding = prefs.getFloat("targetRateLanding", altitudeData.targetRateLanding);
   altitudeData.upGain = prefs.getFloat("upGain", altitudeData.upGain);
   altitudeData.ceiling = prefs.getFloat("ceiling", altitudeData.ceiling);
-  trimPitch = prefs.getFloat("trimPitch", trimPitch);
-  trimRoll = prefs.getFloat("trimRoll", trimRoll);
-  trimYaw = prefs.getFloat("trimYaw", trimYaw);
-  throttleLimit = prefs.getFloat("throttleLimit", throttleLimit);
-  throttleLimit = constrain(throttleLimit,0.0,1.0); //protect from a fat finger
-  UP_COEFF = prefs.getFloat("UP_COEFF", UP_COEFF);
-  DOWN_COEFF = prefs.getFloat("DOWN_COEFF", DOWN_COEFF);
-  failsafeCoeff = prefs.getFloat("failsafeCoeff", failsafeCoeff);
-  stick_dampener = prefs.getFloat("stick_dampener", stick_dampener);
+  configData.trimPitch = prefs.getFloat("trimPitch", configData.trimPitch);
+  configData.trimRoll = prefs.getFloat("trimRoll", configData.trimRoll);
+  configData.trimYaw = prefs.getFloat("trimYaw", configData.trimYaw);
+  configData.throttleLimit = prefs.getFloat("throttleLimit", configData.throttleLimit);
+  configData.throttleLimit = constrain(configData.throttleLimit,0.0,1.0); //protect from a fat finger
+  configData.UP_COEFF = prefs.getFloat("UP_COEFF", configData.UP_COEFF);
+  configData.DOWN_COEFF = prefs.getFloat("DOWN_COEFF", configData.DOWN_COEFF);
+  configData.failsafeCoeff = prefs.getFloat("failsafeCoeff", configData.failsafeCoeff);
+  configData.stick_dampener = prefs.getFloat("stick_dampener", configData.stick_dampener);
   pid.i_limit_angle = prefs.getFloat("i_limit_angle", pid.i_limit_angle);
   pid.i_limit_rate = prefs.getFloat("i_limit_rate", pid.i_limit_rate);
-  B_madgwick = prefs.getFloat("B_madgwick", B_madgwick);
-  Accel_filter = prefs.getFloat("Accel_filter", Accel_filter);
-  Gyro_filter = prefs.getFloat("Gyro_filter", Gyro_filter);
+  configData.B_madgwick = prefs.getFloat("B_madgwick", configData.B_madgwick);
+  configData.Accel_filter = prefs.getFloat("Accel_filter", configData.Accel_filter);
+  configData.Gyro_filter = prefs.getFloat("Gyro_filter", configData.Gyro_filter);
 
   pid.Kp_roll_rate = prefs.getFloat("Kp_roll_rate", pid.Kp_roll_rate);
   pid.Ki_roll_rate = prefs.getFloat("Ki_roll_rate", pid.Ki_roll_rate);
@@ -2407,13 +2360,13 @@ void loadParameters()
 
   rollLimits.maxRate = prefs.getFloat("roll_maxRate", rollLimits.maxRate);
   pitchLimits.maxRate = prefs.getFloat("pitch_maxRate", pitchLimits.maxRate);
-  maxRoll = prefs.getFloat("maxRoll", maxRoll);
-  maxPitch = prefs.getFloat("maxPitch", maxPitch);
-  rateControlMode = prefs.getInt("rateControlMode", rateControlMode);
-  maxRoll = constrain(maxRoll,5,70);
-  maxPitch = constrain(maxPitch, 5, 70);
-  maxYaw = prefs.getFloat("maxYaw", maxYaw);
-  K_pos2pwm = prefs.getFloat("K_pos2pwm", K_pos2pwm);
+  configData.maxRoll = prefs.getFloat("maxRoll", configData.maxRoll);
+  configData.maxPitch = prefs.getFloat("maxPitch", configData.maxPitch);
+  configData.rateControlMode = prefs.getInt("rateControlMode", configData.rateControlMode);
+  configData.maxRoll = constrain(configData.maxRoll,5,70);
+  configData.maxPitch = constrain(configData.maxPitch, 5, 70);
+  configData.maxYaw = prefs.getFloat("maxYaw", configData.maxYaw);
+  configData.K_pos2pwm = prefs.getFloat("K_pos2pwm", configData.K_pos2pwm);
   pid.Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", pid.Kp_yaw_rate);
   pid.Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", pid.Ki_yaw_rate);
   pid.Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", pid.Kd_yaw_rate);
@@ -2491,7 +2444,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Angle Integral Max:</td><td><input type=number step=.0001 name=i_limit_angle style='width:90px;' value='" + String(pid.i_limit_angle) + "'></td>";
   body += "<td>Rate Integral Max:</td><td><input type=number step=.0001 name=i_limit_rate style='width:90px;' value='" + String(pid.i_limit_rate) + "'></td></tr>";
   body += "<tr><td>B_Madgwick (0.03 default):</td><td><input type=number step=.0001 name=B_madgwick style='width:90px;' value='" +
-  String(B_madgwick) + "'></td></tr>";
+  String(configData.B_madgwick) + "'></td></tr>";
   body += "</table><br>";
   body += "<b>Rate and Angle Limits:</b><br>";
   body += "<table class=table>";
@@ -2499,14 +2452,14 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Rate Control Mode:</td><td>"
         "<input type='hidden' name='rateControlMode' value='0'>"
         "<input type='checkbox' name='rateControlMode' value='1' " 
-        + String(rateControlMode ? "checked" : "") + ">"
+        + String(configData.rateControlMode ? "checked" : "") + ">"
         "</td></tr>";
   body += "<tr><td>Roll Rate (deg/s):</td><td><input name=roll_maxRate style='width:90px;' type=number value='" + String(rollLimits.maxRate) + "'></td>";
-  body += "<td>Roll (max angle):</td><td><input name=maxRoll style='width:90px;' type=number value='" + String(maxRoll) + "'></td></tr>";
+  body += "<td>Roll (max angle):</td><td><input name=maxRoll style='width:90px;' type=number value='" + String(configData.maxRoll) + "'></td></tr>";
   body += "<tr><td>Pitch Rate (deg/s):</td><td><input name=pitch_maxRate style='width:90px;' type=number value='" + String(pitchLimits.maxRate) + "'></td>";
-  body += "<td>Pitch (max angle):</td><td><input name=maxPitch style='width:90px;' type=number value='" + String(maxPitch) + "'></td></tr>";
-  body += "<tr><td>Yaw Rate (deg/s):</td><td><input name=maxYaw style='width:90px;' type=number value='" + String(maxYaw) + "'></td>";
-  body += "<td>Home Pitch Gain (K_pos2pwm):</td><td><input name=K_pos2pwm style='width:90px;' step=.1 type=number value='" + String(K_pos2pwm,1) + "'></td></tr>";
+  body += "<td>Pitch (max angle):</td><td><input name=maxPitch style='width:90px;' type=number value='" + String(configData.maxPitch) + "'></td></tr>";
+  body += "<tr><td>Yaw Rate (deg/s):</td><td><input name=maxYaw style='width:90px;' type=number value='" + String(configData.maxYaw) + "'></td>";
+  body += "<td>Home Pitch Gain (K_pos2pwm):</td><td><input name=K_pos2pwm style='width:90px;' step=.1 type=number value='" + String(configData.K_pos2pwm,1) + "'></td></tr>";
   body += "</table>";
   body += "<br>Tip: Before powering down, Save to Storage - but if just experimenting during the session hold off saving to extend the Flash Storage life.<br>";
   // Additional parameters table 
@@ -2517,16 +2470,16 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Landing Up Gain Multiplier:</td><td><input type=number name=upGain style='width:100px;' step = .01 value='" + String(altitudeData.upGain,2) + "'></td></tr>";
   body += "<tr><td>Kp Altitude Rate:</td><td><input type=number name=kp_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.kp_altitude_rate,5) + "'></td></tr>";
   body += "<tr><td>Ki Altitude Rate:</td><td><input type=number name=ki_altitude_rate style='width:100px;' step = .00001 value='" + String(altitudeData.ki_altitude_rate,5) + "'></td></tr>";
-  body += "<tr><td>Trim - Pitch (-500 to 500):</td><td><input type=number name=trimPitch style='width:80px;' value='" + String(trimPitch) + "'></td></tr>";
-  body += "<tr><td>Trim - Roll (-500 to 500):</td><td><input type=number name=trimRoll style='width:80px;' value='" + String(trimRoll) + "'></td></tr>";
-  body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(trimYaw) + "'></td></tr>";
-  body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(throttleLimit, 2) + "'></td></tr>";
-  body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(UP_COEFF, 3) + "'></td></tr>";
-  body += "<tr><td>Down Dampening (0.00001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.00001 name=DOWN_COEFF style='width:80px;' value='" +  String(DOWN_COEFF, 5) + "'></td></tr>";
-  body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(failsafeCoeff, 6) + "'></td></tr>";
-  body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(stick_dampener, 3) + "'></td></tr>";
-  body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(Accel_filter) + "'></td></tr>";
-  body += "<tr><td>Gyro Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Gyro_filter style='width:80px;' value='" + String(Gyro_filter) + "'></td></tr>";
+  body += "<tr><td>Trim - Pitch (-500 to 500):</td><td><input type=number name=trimPitch style='width:80px;' value='" + String(configData.trimPitch) + "'></td></tr>";
+  body += "<tr><td>Trim - Roll (-500 to 500):</td><td><input type=number name=trimRoll style='width:80px;' value='" + String(configData.trimRoll) + "'></td></tr>";
+  body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(configData.trimYaw) + "'></td></tr>";
+  body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(configData.throttleLimit, 2) + "'></td></tr>";
+  body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(configData.UP_COEFF, 3) + "'></td></tr>";
+  body += "<tr><td>Down Dampening (0.00001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.00001 name=DOWN_COEFF style='width:80px;' value='" +  String(configData.DOWN_COEFF, 5) + "'></td></tr>";
+  body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(configData.failsafeCoeff, 6) + "'></td></tr>";
+  body += "<tr><td>Stick Dampening (0.01-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.001 name=stick_dampener style='width:80px;' value='" +  String(configData.stick_dampener, 3) + "'></td></tr>";
+  body += "<tr><td>Accel Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Accel_filter style='width:80px;' value='" + String(configData.Accel_filter) + "'></td></tr>";
+  body += "<tr><td>Gyro Dampening (0.1-1.0):<br>0.1=slow/steady, 1.0=noisy/fast</td><td><input type=number step=0.01 name=Gyro_filter style='width:80px;' value='" + String(configData.Gyro_filter) + "'></td></tr>";
   body += "</table>";
   // Buttons 
   body += "<br><input "
