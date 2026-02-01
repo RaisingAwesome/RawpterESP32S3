@@ -4,6 +4,7 @@
 
 #include <SparkFun_BMP581_Arduino_Library.h> // BMP581 Pressure Sensor
 #include <SparkFun_u-blox_GNSS_v3.h>         // Max10S GPS
+#include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
 
 struct AltitudeData
 {
@@ -50,30 +51,6 @@ struct Limits
   float maxRate =120; // deg/s
 };
 
-struct PIDConstants
-{
-  // PID parameters (this is where you set the.  It's best to use the WiFi interface to do it live and then update once its tuned.):
-  float i_limit_angle = 0.5f;      // Integrator saturation level
-  float i_limit_rate = 4.0f; // Integrator saturation level
-
-  float Kp_roll_angle = 3.0f;    // Roll P-gain
-  float Ki_roll_angle = 0.001f;  // Roll I-gain
-
-  float Kp_pitch_angle = 3.0f;   // Pitch P-gain
-  float Ki_pitch_angle = 0.001f; // Pitch I-gain
-
-  float Kp_roll_rate = 0.0015f;  // Roll P-gain
-  float Ki_roll_rate = 0.003f;   // Roll I-gain
-   Kd_roll_rate = 0.0f;     // Roll D-gain
-
-  float Kp_pitch_rate = 0.0015f; // Pitch P-gain
-  float Ki_pitch_rate = 0.003f;  // Pitch I-gain
-  float Kd_pitch_rate = 0.0f;    // Pitch D-gain
-
-  float Kp_yaw_rate = 0.0015f;   // Yaw P-gain default 30
-  float Ki_yaw_rate = 0.003f;    // Yaw I-gain default 5
-  float Kd_yaw_rate = 0.0f;      // Yaw D-gain default .015 (be careful when increasing too high, motors will begin to overheat!)
-};
 
 struct ConfigData
 {
@@ -96,4 +73,43 @@ struct ConfigData
   float Accel_filter = 0.9f; // Lower is slower to catch up. Higher is faster to track, but can have a lot of noise. 1 is no filter
   bool rateControlMode = false;
   float K_pos2pwm = 50.0f;  // gain for headHome routine
+
+  // PID parameters (this is where you set the.  It's best to use the WiFi interface to do it live and then update once its tuned.):
+  float i_limit_angle = 0.5f;      // Integrator saturation level
+  float i_limit_rate = 4.0f; // Integrator saturation level
+
+  float Kp_roll_angle = 3.0f;    // Roll P-gain
+  float Ki_roll_angle = 0.001f;  // Roll I-gain
+
+  float Kp_pitch_angle = 3.0f;   // Pitch P-gain
+  float Ki_pitch_angle = 0.001f; // Pitch I-gain
+
+  float Kp_roll_rate = 0.0015f;  // Roll P-gain
+  float Ki_roll_rate = 0.003f;   // Roll I-gain
+  float Kd_roll_rate = 0.0f;     // Roll D-gain
+
+  float Kp_pitch_rate = 0.0015f; // Pitch P-gain
+  float Ki_pitch_rate = 0.003f;  // Pitch I-gain
+  float Kd_pitch_rate = 0.0f;    // Pitch D-gain
+
+  float Kp_yaw_rate = 0.0015f;   // Yaw P-gain default 30
+  float Ki_yaw_rate = 0.003f;    // Yaw I-gain default 5
+  float Kd_yaw_rate = 0.0f;      // Yaw D-gain default .015 (be careful when increasing too high, motors will begin to overheat!)
+};
+
+struct BatteryMonitor
+{
+  // Voltage Monitoring and Beeping
+  int batteryVoltage = 777;             // just a default for the battery monitoring routine
+  float calced_voltage = 14.8;
+};
+
+struct RadioData
+{
+  // Radio communication:
+  int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
+  int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
+  bool failsafed = false;
+  bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
+  RmtPPMReader radio;
 };
