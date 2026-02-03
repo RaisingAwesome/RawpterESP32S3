@@ -2,7 +2,7 @@
 // Library dependencies for the complete project
 #pragma once
 
-#include "DataTypes.h"
+#include "Types.h"
 #include "Constants.h"
 #include <SPI.h>                             // SPI Communication Support for IMU
 #include <WiFi.h>                            // ESP32 Adhoc WiFi Support
@@ -16,3 +16,4 @@
 #include <Preferences.h>
 #include <SparkFun_BMP581_Arduino_Library.h> // BMP581 Pressure Sensor
 #include <SparkFun_u-blox_GNSS_v3.h>         // Max10S GPS
+#include "SensorTypes.h"                     // IMU, GPS, Pressure Sensor data structures and routines

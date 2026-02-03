@@ -23,54 +23,16 @@ RadioData radioData{};
 Motors motors{};
 PID pid{};
 Telemetry telemetry{};
-
-// Madgwick Parameters (the method that calculates angles fromt he IMU)
-static float recipNorm;
-static float s0, s1, s2, s3;
-static float qDot1, qDot2, qDot3, qDot4;
-static float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
-static float q0 = 1.0f; // Initialize quaternion for madgwick filter
-static float q1 = 0.0f;
-static float q2 = 0.0f;
-static float q3 = 0.0f;
-static unsigned long lastMadgwickUpdateMicros = 0;
-static float madDeltaTime = 1 / IMU_FREQ_HZ;
+IMU imu{};
 
 // General stuff for controlling timing of things
-static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
-static bool resetTimers = false;
-static unsigned long tick_time, prev_time;
-static unsigned long print_counter;
-static volatile unsigned long debugger;
-static bool playingSong = false;
-static TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop task that will run on its own core.
-
-// IMU:
-static float AccX, AccY, AccZ;
-static float AccX_prev, AccY_prev, AccZ_prev;
-static float GyroX, GyroY, GyroZ;
-static float GyroX_prev, GyroY_prev, GyroZ_prev;
-static float roll_IMU, pitch_IMU, yaw_IMU;
-static float roll_IMU_prev, pitch_IMU_prev;
-
-// GPS Flight Controller
-static float AccErrorX = 0.03;
-static float AccErrorY = -0.14;
-static float AccErrorZ = 1.00;
-static float GyroErrorX = 1.10;
-static float GyroErrorY = -1.58;
-static float GyroErrorZ = 0.67;
-/* No GPS Flight Controller
-static float AccErrorX = -0.01;
-static float AccErrorY = 0.02;
-static float AccErrorZ = -0.01;
-static float GyroErrorX = -1.02;
-static float GyroErrorY = 0.38;
-static float GyroErrorZ = 0.55;
-*/
-
-static SPIClass IMUSPI(HSPI);
-
+unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
+bool resetTimers = false;
+unsigned long tick_time, prev_time;
+unsigned long print_counter;
+volatile unsigned long debugger;
+bool playingSong = false;
+TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop task that will run on its own core.
 
 //========================================================================================================================//
 // BEGIN THE CLASSIC SETUP AND LOOP
@@ -82,14 +44,14 @@ void setup()
   loopDroneHandle = xTaskGetCurrentTaskHandle(); // for messeging between tasks
   setupSerial();             // Sets up both Serial and Serial1 for communication.
   setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
-  setupMotorCommunication(); // Sets up ledc channels for motor control
+  setupMotorCommunication(); // Sets up hardware Motor Control PWM for commanding the motors
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
-  setupPeripherals();
+  setupPeripherals();        // Sets up I2C, ADC resolution, and any other peripherals needed
   setupBatteryMonitor();     // Sets up the ADC to monitor battery voltage
   setupWiFi();               // Sets up the WiFi access point and web server
   setupGPS();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
   setupPressureSensor();     // Gets some default info and ensures their is a working BMP581 on board
-  setupIMU();                // Ensures there is a working IMU on board - it's imperative.
+  imu.begin();                // Ensures there is a working IMU on board - it's imperative.
   //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   
   playStartSong();
@@ -108,7 +70,7 @@ void loop()
   tick();
   syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
   getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
-  getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  imu.getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
@@ -729,378 +691,12 @@ float getCalcedVoltage()
   return (((float)batteryMonitor.batteryVoltage * 0.0397) - 3.6127);
 }
 
-void setupIMU()
-{
-  // DESCRIPTION: Initialize IMU and set to 2000Hz gyro and 2000Hz accel output rates.
-  pinMode(IMU_INT_PIN, INPUT);
-  pinMode(SPI_CS, OUTPUT);
-  gpio_set_level((gpio_num_t)SPI_CS, 1);              // Deselect device
-  IMUSPI.begin(SPI_SCLK, SPI_MISO, SPI_MOSI, SPI_CS); // SCLK, MISO, MOSI, CS
-  delay(100);
-  writeRegister(0x76, 0x0);            // Work with Bank 0
-  writeRegister(0x11, 0x01);           // Soft Reset
-  delay(200);                          // give time for reset
-  uint8_t whoami = readRegister(0x75); // WHO_AM_I register should return 0x3B
-  delay(100);
-  Serial.print("WHO_AM_I: 0x");
-  Serial.println(whoami, HEX);
-  if (whoami == 0x3B)
-  {
-    Serial.println("IMU SPI communication successful.");
-  }
-  else
-  {
-    Serial.println("IMU SPI communication failed. Check wiring, CS pin, or SPI settings. Trying again.");
-    halt();
-    return;
-  }
-
-  writeRegister(0x4E, 0x1F);
-  delay(10); // Turn the accelerator and gyro in Low Noise mode and power the temperature sensor.
-  writeRegister(0x13, 0x05);
-  delay(10); // <2ns SPI Slew Rate
-  writeRegister(0x16, 0x00);
-  delay(10); // Bypass FIFO (don't queue readings)
-  writeRegister(0x4F, 0x26);
-  delay(10); // Gyro 1000 dps at 1kHz updates downsampled from 32kHz 00100110 = 0x26
-  writeRegister(0x50, 0x26);
-  delay(10); // Accel 16g and 1Khz updates 00100110 = 0x26
-  writeRegister(0x65, 0x08);
-  delay(10); // Don't bother interupting after reseet. Interrupt on 1 when data is available.
-  writeRegister(0x76, 0x01);
-  delay(10); // Work with Bank 1
-  writeRegister(0x03, 0x00);
-  delay(10); // Bank 1 register: Use every axis measurement including Z (default has it off)
-  writeRegister(0x7A, 0x02);
-  delay(10); // Bank 1 register: 4 wire SPI mode
-  writeRegister(0x76, 0x0);
-  delay(10); // Work with Bank 0
-
-  MadgwickInit(); // Initialize Madgwick filter with current accelerometer values
-  Serial.println("IMU config complete.");
-}
-
-inline void MadgwickInit()
-{
-  // Initialize Madgwick filter with current accelerometer values
-  // Cuts down on thhe time it takes for Madgwick to converge on a stable attitude.
-  while (gpio_get_level((gpio_num_t)IMU_INT_PIN))
-    delay(10); // Wait for it to pull low to indicate data ready
-
-  // Burst read: 6 accel + 6 gyro bytes in one transaction
-  uint8_t buf[12];
-  readBlock(ACCEL_DATA_X1, buf, 12);
-
-  int16_t rawAx = (buf[0] << 8) | buf[1];
-  int16_t rawAy = (buf[2] << 8) | buf[3];
-  int16_t rawAz = (buf[4] << 8) | buf[5];
-
-  int16_t rawGx = (buf[6] << 8) | buf[7];
-  int16_t rawGy = (buf[8] << 8) | buf[9];
-  int16_t rawGz = (buf[10] << 8) | buf[11];
-
-  // Apply offsets + scaling
-  float ax = (rawAx - AccErrorX) * G_PER_LSB;
-  float ay = (rawAy - AccErrorY) * G_PER_LSB;
-  float az = (rawAz - AccErrorZ) * G_PER_LSB;
-
-  float norm = sqrtf(ax * ax + ay * ay + az * az);
-
-  if (norm == 0.0f)
-    return; // invalid accel
-  ax /= norm;
-  ay /= norm;
-  az /= norm;
-
-  // Compute roll and pitch from gravity
-  float roll = atan2f(ay, az);
-  float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
-  float yaw = 0.0f; // no magnetometer, assume heading = 0
-
-  // Convert to quaternion
-  float cy = cosf(yaw * 0.5f);
-  float sy = sinf(yaw * 0.5f);
-  float cp = cosf(pitch * 0.5f);
-  float sp = sinf(pitch * 0.5f);
-  float cr = cosf(roll * 0.5f);
-  float sr = sinf(roll * 0.5f);
-
-  q0 = cr * cp * cy + sr * sp * sy;
-  q1 = sr * cp * cy - cr * sp * sy;
-  q2 = cr * sp * cy + sr * cp * sy;
-  q3 = cr * cp * sy - sr * sp * cy;
-
-  // Normalize quaternion
-  norm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 /= norm;
-  q1 /= norm;
-  q2 /= norm;
-  q3 /= norm;
-
-  // Cache Euler angles for consistency
-  roll_IMU = roll * 57.29577951f; // RAD2DEG
-  pitch_IMU = -pitch * 57.29577951f; // Flip pitch axis to match NASA
-  yaw_IMU = -yaw * 57.29577951f; // Flip yaw axis to match NASA
-}
-
-inline void getIMUdata()
-{
-  // Fast GPIO read (ESP32 example)
-  if (gpio_get_level((gpio_num_t)IMU_INT_PIN))
-    return; // active LOW
-
-  // Burst read: 6 accel + 6 gyro bytes in one transaction
-  uint8_t buf[12];
-  readBlock(ACCEL_DATA_X1, buf, 12);
-
-  int16_t rawAx = (buf[0] << 8) | buf[1];
-  int16_t rawAy = (buf[2] << 8) | buf[3];
-  int16_t rawAz = (buf[4] << 8) | buf[5];
-
-  int16_t rawGx = (buf[6] << 8) | buf[7];
-  int16_t rawGy = (buf[8] << 8) | buf[9];
-  int16_t rawGz = (buf[10] << 8) | buf[11];
-
-  // Apply offsets + scaling
-  float ax = (rawAx - AccErrorX) * G_PER_LSB;
-  float ay = (rawAy - AccErrorY) * G_PER_LSB;
-  float az = (rawAz - AccErrorZ) * G_PER_LSB;
-
-  float gx = (rawGx - GyroErrorX) * DPS_PER_LSB;
-  float gy = (rawGy - GyroErrorY) * DPS_PER_LSB;
-  float gz = (rawGz - GyroErrorZ) * DPS_PER_LSB;
-
-  // Filter (optimized form)
-  AccX = AccX_prev + configData.Accel_filter * (ax - AccX_prev);
-  AccY = AccY_prev + configData.Accel_filter * (ay - AccY_prev);
-  AccZ = AccZ_prev + configData.Accel_filter * (az - AccZ_prev);
-
-  GyroX = GyroX_prev + configData.Gyro_filter * (gx - GyroX_prev);
-  GyroY = GyroY_prev + configData.Gyro_filter * (gy - GyroY_prev);
-  GyroZ = GyroZ_prev + configData.Gyro_filter * (gz - GyroZ_prev);
-
-  AccX_prev = AccX;
-  AccY_prev = AccY;
-  AccZ_prev = AccZ;
-  GyroX_prev = GyroX;
-  GyroY_prev = GyroY;
-  GyroZ_prev = GyroZ;
-
-  // Timing
-  unsigned long currentMicros = micros();
-  unsigned long tempMicros = (currentMicros - lastMadgwickUpdateMicros);
-  //if (tempMicros>=0 && tempMicros<1000) madDeltaTime = tempMicros * USEC_TO_SEC; else madDeltaTime=0.0005f;
-  madDeltaTime = tempMicros * USEC_TO_SEC;
-  lastMadgwickUpdateMicros = currentMicros;
-
-  // Madgwick update
-  // The IMU’s Z‑axis physically points upward, but our control system uses the NED frame where Z points downward. 
-  // NED (North-East-Down) is standard aerospace frame.
-  // X --> forward positive
-  // Y --> right positive
-  // Z --> down positive
-  // The Rawpter is installed like this:
-  // IMU X --> Back of drone
-  // IMU Y --> Left of drone
-  // IMU Z --> Up to the sky
-  // So, to map it to the IMU's physical installation in the frame, for a Z now being roll up when compared to NED,
-  // and X pointing backwards, Y will be positive in the oppositve direction. Based on how the board is installed, 
-  // X is actually pointing to the back of the drone, so its AccX needs flipped. Thus, you call Madgwick like this:
-  Madgwick6DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
-}
-
 void setupPPM()
 {
   radioData.radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
 }
 
-inline void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
-{
-  // Precomputed constants
-  constexpr float DEG2RAD = 0.01745329252f; // π/180
-  constexpr float RAD2DEG = 57.29577951f;   // 180/π
 
-  // Convert gyro to rad/s
-  gx *= DEG2RAD;
-  gy *= DEG2RAD;
-  gz *= DEG2RAD;
-
-  // Rate of change of quaternion
-  const float half = 0.5f;
-  qDot1 = half * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = half * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = half * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = half * (q0 * gz + q1 * gy - q2 * gx);
-
-  // Accelerometer valid?
-  if (!(ax == 0.0f && ay == 0.0f && az == 0.0f))
-  {
-    // Normalize accelerometer
-    float norm = ax * ax + ay * ay + az * az;
-    float recipNorm = 1.0f / sqrtf(norm);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
-
-    // Precompute reused terms
-    float q0q0 = q0 * q0, q1q1 = q1 * q1, q2q2 = q2 * q2, q3q3 = q3 * q3;
-    float _2q0 = 2.0f * q0, _2q1 = 2.0f * q1, _2q2 = 2.0f * q2, _2q3 = 2.0f * q3;
-    float _4q0 = 2.0f * _2q0, _4q1 = 2.0f * _2q1, _4q2 = 2.0f * _2q2;
-    float _8q1 = 2.0f * _4q1, _8q2 = 2.0f * _4q2;
-
-    // Gradient descent step
-    float s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    float s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    float s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    float s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
-
-    recipNorm = 1.0f / sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    // Apply feedback
-    qDot1 -= B_madgwick * s0;
-    qDot2 -= B_madgwick * s1;
-    qDot3 -= B_madgwick * s2;
-    qDot4 -= B_madgwick * s3;
-  }
-
-  // Integrate quaternion
-  q0 += qDot1 * dt;
-  q1 += qDot2 * dt;
-  q2 += qDot3 * dt;
-  q3 += qDot4 * dt;
-
-  // Normalize quaternion
-  float norm = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
-  recipNorm = 1.0f / sqrtf(norm);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-
-  // Compute angles (cache reused terms)
-  float twoq0q1 = 2.0f * (q0 * q1);
-  float twoq2q3 = 2.0f * (q2 * q3);
-  float twoq0q2 = 2.0f * (q0 * q2);
-  float twoq1q3 = 2.0f * (q1 * q3);
-  float twoq0q3 = 2.0f * (q0 * q3);
-  float twoq1q2 = 2.0f * (q1 * q2);
-
-  roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-  pitch_IMU = -asin(-2.0f * (q1*q3 - q0*q2))*57.29577951; //degrees
-  yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
-}
-/*
-void calculateIMUError()
-{
-  Serial.println("Calculating IMU Error with 30000 filtered iterations. Please stand by...");
-
-  constexpr float ACC_LSB_PER_G = 1024.0f; // ±32 g
-  constexpr float G_PER_LSB = 1.0f / ACC_LSB_PER_G;
-  constexpr float GYRO_LSB_PER_DPS = 16.4f; // 2000 dps
-  constexpr float DPS_PER_LSB = 1.0f / GYRO_LSB_PER_DPS;
-
-  // Filtering parameters
-  constexpr float ALPHA = 0.05f;                 // Low‑pass filter coefficient (0.0–1.0)
-  constexpr float OUTLIER_THRESHOLD_ACC = 0.25f; // g
-  constexpr float OUTLIER_THRESHOLD_GYRO = 5.0f; // deg/s
-
-  float fAccX = 0, fAccY = 0, fAccZ = 0;
-  float fGyroX = 0, fGyroY = 0, fGyroZ = 0;
-
-  AccErrorX = AccErrorY = AccErrorZ = 0;
-  GyroErrorX = GyroErrorY = GyroErrorZ = 0;
-
-  int c = 0;
-  while (c < 30000)
-  {
-    while (digitalRead(IMU_INT_PIN) == HIGH)
-      delay(1);
-
-    float rawAccX = read16(ACCEL_DATA_X1) * G_PER_LSB;
-    float rawAccY = read16(ACCEL_DATA_X1 + 2) * G_PER_LSB;
-    float rawAccZ = read16(ACCEL_DATA_X1 + 4) * G_PER_LSB;
-
-    float rawGyroX = read16(GYRO_DATA_X1) * DPS_PER_LSB;
-    float rawGyroY = read16(GYRO_DATA_X1 + 2) * DPS_PER_LSB;
-    float rawGyroZ = read16(GYRO_DATA_X1 + 4) * DPS_PER_LSB;
-    if (c == 0)
-    {
-      fAccX = rawAccX;
-      fAccY = rawAccY;
-      fAccZ = rawAccZ;
-      fGyroX = rawGyroX;
-      fGyroY = rawGyroY;
-      fGyroZ = rawGyroZ;
-    }
-    else
-    {
-      // -------- OUTLIER REJECTION --------
-      if (fabs(rawAccX - fAccX) < OUTLIER_THRESHOLD_ACC)
-        fAccX = fAccX + ALPHA * (rawAccX - fAccX);
-      if (fabs(rawAccY - fAccY) < OUTLIER_THRESHOLD_ACC)
-        fAccY = fAccY + ALPHA * (rawAccY - fAccY);
-      if (fabs(rawAccZ - fAccZ) < OUTLIER_THRESHOLD_ACC)
-        fAccZ = fAccZ + ALPHA * (rawAccZ - fAccZ);
-
-      if (fabs(rawGyroX - fGyroX) < OUTLIER_THRESHOLD_GYRO)
-        fGyroX = fGyroX + ALPHA * (rawGyroX - fGyroX);
-      if (fabs(rawGyroY - fGyroY) < OUTLIER_THRESHOLD_GYRO)
-        fGyroY = fGyroY + ALPHA * (rawGyroY - fGyroY);
-      if (fabs(rawGyroZ - fGyroZ) < OUTLIER_THRESHOLD_GYRO)
-        fGyroZ = fGyroZ + ALPHA * (rawGyroZ - fGyroZ);
-    }
-    // -------- ACCUMULATE FILTERED VALUES --------
-    AccErrorX += fAccX;
-    AccErrorY += fAccY;
-    AccErrorZ += fAccZ;
-
-    GyroErrorX += fGyroX;
-    GyroErrorY += fGyroY;
-    GyroErrorZ += fGyroZ;
-
-    c++;
-
-    if (c % 500 == 0)
-      Serial.println(String(30000 - c));
-  }
-
-  // -------- FINAL AVERAGE --------
-  AccErrorX /= c;
-  AccErrorY /= c;
-  AccErrorZ = (AccErrorZ / c) - 1.0f; // subtract gravity
-
-  GyroErrorX /= c;
-  GyroErrorY /= c;
-  GyroErrorZ /= c;
-
-  Serial.print("static float AccErrorX = ");
-  Serial.print(AccErrorX);
-  Serial.println(";");
-  Serial.print("static float AccErrorY = ");
-  Serial.print(AccErrorY);
-  Serial.println(";");
-  Serial.print("static float AccErrorZ = ");
-  Serial.print(AccErrorZ);
-  Serial.println(";");
-
-  Serial.print("static float GyroErrorX = ");
-  Serial.print(GyroErrorX);
-  Serial.println(";");
-  Serial.print("static float GyroErrorY = ");
-  Serial.print(GyroErrorY);
-  Serial.println(";");
-  Serial.print("static float GyroErrorZ = ");
-  Serial.print(GyroErrorZ);
-  Serial.println(";");
-
-  Serial.println("Paste these values in user specified variables section and comment out calculateIMUError() in void setup.");
-  halt();
-}
-*/
 inline void getDesiredAnglesAndThrottleScaledToOne()
 {
   // DESCRIPTION: Normalizes desired control values to appropriate values
@@ -1128,8 +724,8 @@ inline void resetAllTiming()
   // Once flicked back into flight mode, this will set all frequencies to the same start light just incase there was drift.
   resetTimers = false;
   unsigned long currentMicros = micros();
-  lastMadgwickUpdateMicros = currentMicros; // Used for Madgwick delta time calculations
-  PIDCounter = 0;                           // using ticks to keep everything in sync
+  imu.lastMadgwickUpdateMicros = currentMicros; // Used for Madgwick delta time calculations
+  pid.PIDCounter = 0;                           // using ticks to keep everything in sync
   motors.ESCWriteCounter = 0;                      // using ticks to keep everything in sync
 }
 
@@ -1140,9 +736,9 @@ void PIDControlCalcs()
   static float integral_rate_pitch = 0.0f;
   static float integral_rate_yaw = 0.0f;
 
-  float p = GyroX; // roll rate 
-  float q = GyroY; // pitch rate (nose up positive) - pitch is already minused to correct physical orientation to NASA rules
-  float r = GyroZ; 
+  float p = imu.GyroX; // roll rate 
+  float q = imu.GyroY; // pitch rate (nose up positive) - pitch is already minused to correct physical orientation to NASA rules
+  float r = imu.GyroZ; 
   
   if (radioData.PWM_throttle < 1520) // Reset the control if on the ground. This prevents integral windup and sudden jumps on takeoff.
   {
@@ -1161,7 +757,7 @@ void PIDControlCalcs()
   else AngleLoopCalcs(); // Get the new desired angular rates based on current angle versus desired angle
 
   // --- Roll ---
-  float rateErrorRoll = desiredRateRoll - p;
+  float rateErrorRoll = pid.desiredRateRoll - p;
   integral_rate_roll += rateErrorRoll * madDeltaTime;
   integral_rate_roll = constrain(integral_rate_roll, -configData.i_limit_rate, configData.i_limit_rate); // Think of this as the tracked energy required to achieve motor torque
 
@@ -1206,7 +802,7 @@ void AngleLoopCalcs()
   lastTimeMicros = micros();
 
   // --- Roll ---
-  float angleErrorRoll = pid.roll_des - roll_IMU;
+  float angleErrorRoll = pid.roll_des - imu.roll_IMU;
   integral_roll += angleErrorRoll * dt;
   integral_roll = constrain(integral_roll, -configData.i_limit_angle, configData.i_limit_angle);
 
@@ -1215,7 +811,7 @@ void AngleLoopCalcs()
   pid.desiredRateRoll = constrain(pid.desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
 
   // --- Pitch ---
-  float angleErrorPitch = pid.pitch_des - pitch_IMU;
+  float angleErrorPitch = pid.pitch_des - imu.pitch_IMU;
   integral_pitch += angleErrorPitch * dt;
   integral_pitch = constrain(integral_pitch, -configData.i_limit_angle, configData.i_limit_angle);
 
@@ -1547,7 +1143,7 @@ void throttleCut()
           altitudeData.fastestAscent = 0.0f;
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
           setHome();         // Set home position on throttle uncut.
-          MadgwickInit();     // Reset the quarterion based on sitting still.
+          imu.MadgwickInit();     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
         }
       }
@@ -1570,7 +1166,7 @@ void throttleCut()
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
   if (radioData.PWM_throttle<1600&&!BENCH_TESTING)
   {
-    if (roll_IMU > 75 || roll_IMU < -75 || pitch_IMU > 75 || pitch_IMU < -75)
+    if (imu.roll_IMU > 75 || imu.roll_IMU < -75 || imu.pitch_IMU > 75 || imu.pitch_IMU < -75)
     {
       killMotors();
       return;
@@ -1581,7 +1177,7 @@ void throttleCut()
   {
     if (!telemetry.flying && altitudeData.altitude < 2 && !BENCH_TESTING) // this is tip over protection at take-off
     {
-      if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
+      if (imu.roll_IMU > 15 || imu.roll_IMU < -15 || imu.pitch_IMU > 15 || imu.pitch_IMU < -15)
       {
         // This helps with struggles on take off or it sitting too tilted on the launch pad.
         killMotors();
@@ -1686,11 +1282,11 @@ void printGyroData()
   {
     print_counter = micros();
     Serial.print(F("GyroX: "));
-    Serial.print(GyroX);
+    Serial.print(imu.GyroX);
     Serial.print(F(" GyroY: "));
-    Serial.print(GyroY);
+    Serial.print(imu.GyroY);
     Serial.print(F(" GyroZ: "));
-    Serial.println(GyroZ);
+    Serial.println(imu.GyroZ);
   }
 }
 
@@ -1728,12 +1324,11 @@ void printJSON()
   { // Don't go too fast or it slows down the main loop. this is a third of a second.
     print_counter = micros();
     Serial.print(F("{\"roll\": "));
-    Serial.print(roll_IMU);
+    Serial.print(imu.roll_IMU);
     Serial.print(F(", \"pitch\": "));
-    Serial.print(pitch_IMU);
+    Serial.print(imu.pitch_IMU);
     Serial.print(F(", \"yaw\": "));
-    Serial.print(yaw_IMU);
-
+    Serial.print(imu.yaw_IMU);
     Serial.print(F(", \"RollKp\": "));
     Serial.print(configData.Kp_roll_rate);
     Serial.print(F(", \"RollKi\": "));
@@ -1758,17 +1353,17 @@ void printJSON()
     Serial.print(AccZ);
 
     Serial.print(F(", \"GyroX\": "));
-    Serial.print(GyroX);
+    Serial.print(imu.GyroX);
     Serial.print(F(", \"GyroY\": "));
-    Serial.print(GyroY);
+    Serial.print(imu.GyroY);
     Serial.print(F(", \"GyroZ\": "));
-    Serial.print(GyroZ);
+    Serial.print(imu.GyroZ);
     Serial.print(F(", \"RollIMU\": "));
-    Serial.print(roll_IMU);
+    Serial.print(imu.roll_IMU);
     Serial.print(F(", \"PitchIMU\": "));
-    Serial.print(pitch_IMU);
+    Serial.print(imu.pitch_IMU);
     Serial.print(F(", \"YawIMU\": "));
-    Serial.print(yaw_IMU);
+    Serial.print(imu.yaw_IMU);
 
     Serial.print(F(", \"ThroDes\": "));
     Serial.print(pid.throttle_desired);
@@ -1816,11 +1411,11 @@ void printRollPitchYaw()
   {
     print_counter = micros();
     Serial.print(F("roll: "));
-    Serial.print(pid.roll_IMU);
+    Serial.print(imu.roll_IMU);
     Serial.print(F(" pitch: "));
-    Serial.print(pid.pitch_IMU);
+    Serial.print(imu.pitch_IMU);
     Serial.print(F(" yaw: "));
-    Serial.println(pid.yaw_IMU);
+    Serial.println(imu.yaw_IMU);
   }
 }
 
@@ -2369,8 +1964,8 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<span style='font-size:10px;'> by Raising Awesome <a href='/' style='margin-top:4px; padding:3px 6px; background-color:#0d6efd; color:#fff; border:1px solid #0d6efd; border-radius:2px; width:100%; cursor:pointer; font-size:10px;'>refresh</a></span></h1><hr>";
   body += "<b>Snapshot:</b><br>";
   body += "<table>";
-  body += "<tr><td>Desired Roll=" + String(roll_des) + "&#176;</td><td>IMU Roll=" + String(roll_IMU) + "&#176;</td></tr>";
-  body += "<tr><td>Desired Pitch=" + String(pitch_des) + "&#176;</td><td>IMU Pitch=" + String(pitch_IMU) + "&#176;</td></tr>";
+  body += "<tr><td>Desired Roll=" + String(pid.roll_des) + "&#176;</td><td>IMU Roll=" + String(imu.roll_IMU) + "&#176;</td></tr>";
+  body += "<tr><td>Desired Pitch=" + String(pid.pitch_des) + "&#176;</td><td>IMU Pitch=" + String(imu.pitch_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Loop Time=" + String(int(round((madDeltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(radioData.PWM_throttle) + "</td></tr>";
   body += "<tr><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
   body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(highestThrottlePWM) + "</td></tr>";

@@ -1,50 +1,9 @@
-// DataTypes.h
-// Object oriented structs and variables
+// Types.h
+//Structs and variables
 #pragma once
 
-#include <SparkFun_BMP581_Arduino_Library.h> // BMP581 Pressure Sensor
-#include <SparkFun_u-blox_GNSS_v3.h>         // Max10S GPS
 #include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
-
-struct AltitudeData
-{
-  BMP581 pressureSensor;
-  uint8_t i2cAddress = 0x46;      // 0x46 is the Pressure Sensor 0x42 is the GPS
-  volatile float altitude = 0.0f; // just a default until it starts to loop.
-  float highestAltitude = 0.0f;
-  float ceiling = 12.0f;
-  volatile float rateFPS = 0.0f;         // Used to ensure it doesn't descend too quickly
-  volatile float rateFPSWorking = 0.0f;  // This one is worked by the pressure task and then synced to rateFPS variable in the main loop.
-  volatile float altitudeWorking = 0.0f; // This one is worked by the pressure task and then synced to altitude variable in the main loop.
-  float maxAltitudeChangeRate = .8f;
-  float kp_altitude_rate = .0001f;
-  float ki_altitude_rate = .0001f;
-  volatile float invGroundPressure = 0.0f;        // reciprocal of baseline pressure at startup
-  volatile float invGroundPressureWorking = 0.0f; // This one is worked by the pressure task and then synced to invGroundPressure variable in the main loop.
-  TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
-  bool hasBMP581 = false;
-  float sessionHoverPWM =1600;
-  float targetRateLanding = -0.1f; // ft/sec
-  float upGain = 4.0f; // How hared to push back up if descend too quickly on landing
-  float fastestAscent = 0.0f; // ft/sec
-};
-
-// GPS
-struct GPSData
-{
-  bool hasGPS = false;
-  bool useGPS = false;
-  SFE_UBLOX_GNSS Max10SGPS;
-  double longitude = 0;
-  double latitude = 0;
-  double longitudeWorking = 0;
-  double latitudeWorking = 0;
-  uint8_t fixType = 0;
-  bool atHome = false;
-  bool homeValid = false;
-  double homePosLatitude = 0;
-  double homePosLongitude = 0;
-};
+#include "Constants.h"                     // Project constants
 
 struct Limits
 {  // Rate Limits - need to expand this to bring in the K constants and desired setpoints
@@ -114,6 +73,17 @@ struct RadioData
   RmtPPMReader radio;
 };
 
+struct PID
+{
+// PID Controllers:
+  float throttle_desired, roll_des, pitch_des, yaw_des; // Normalized desired state
+  float roll_PID = 0;
+  float pitch_PID = 0;
+  float yaw_PID = 0;
+  float desiredRateRoll, desiredRatePitch;
+  unsigned long PIDCounter = 0;
+};
+
 struct Motors
 {
   // Motor Mixer
@@ -125,19 +95,9 @@ struct Motors
   // Motor Electronic Speed Control Modules (ESC):
   const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
   mcpwm_cmpr_handle_t comparators[4];
-  static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
+  float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 };
 
-struct PID
-{
-// PID Controllers:
-  float throttle_desired, roll_des, pitch_des, yaw_des; // Normalized desired state
-  float roll_PID = 0;
-  float pitch_PID = 0;
-  float yaw_PID = 0;
-  float desiredRateRoll, desiredRatePitch;
-  unsigned long PIDCounter = 0;
-};
 
 struct Telemetry
 {
