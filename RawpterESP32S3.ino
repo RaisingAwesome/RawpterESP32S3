@@ -20,6 +20,9 @@ Limits rollLimits = {160.0f};
 Limits pitchLimits = {160.0f};
 BatteryMonitor batteryMonitor{};
 RadioData radioData{};
+Motors motors{};
+PID pid{};
+Telemetry telemetry{};
 
 // Madgwick Parameters (the method that calculates angles fromt he IMU)
 static float recipNorm;
@@ -32,16 +35,6 @@ static float q2 = 0.0f;
 static float q3 = 0.0f;
 static unsigned long lastMadgwickUpdateMicros = 0;
 static float madDeltaTime = 1 / IMU_FREQ_HZ;
-
-//Telemetry
-static int16_t highestThrottlePWM = 1500;
-static int16_t lowestThrottlePWM = 2000;
-static bool flying = false;
-
-// Motor Electronic Speed Control Modules (ESC):
-const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
-mcpwm_cmpr_handle_t comparators[4];
-static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
 
 // General stuff for controlling timing of things
 static unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -78,19 +71,6 @@ static float GyroErrorZ = 0.55;
 
 static SPIClass IMUSPI(HSPI);
 
-// PID Controller:
-static float throttle_desired, roll_des, pitch_des, yaw_des; // Normalized desired state
-static float roll_PID = 0;
-static float pitch_PID = 0;
-static float yaw_PID = 0;
-static float desiredRateRoll, desiredRatePitch;
-static unsigned long PIDCounter = 0;
-
-// Motor Mixer
-static unsigned long ESCWriteCounter = 0;
-static float m1_command_scaled, m2_command_scaled, m3_command_scaled, m4_command_scaled;
-static float m1_command_scaled_prev, m2_command_scaled_prev, m3_command_scaled_prev, m4_command_scaled_prev;
-static int m1_command_PWM, m2_command_PWM, m3_command_PWM, m4_command_PWM;
 
 //========================================================================================================================//
 // BEGIN THE CLASSIC SETUP AND LOOP
@@ -220,15 +200,15 @@ inline void getAltitudeFromSensor()
   
   setAltitude();
   
-  if (flying && altitudeData.altitudeWorking > altitudeData.highestAltitude)
+  if (telemetry.flying && altitudeData.altitudeWorking > altitudeData.highestAltitude)
     altitudeData.highestAltitude = altitudeData.altitudeWorking;
   if (altitudeData.fastestAscent < altitudeData.rateFPSWorking)
     altitudeData.fastestAscent = altitudeData.rateFPSWorking;
-  if (altitudeData.altitudeWorking >= 2.0f && !flying)
+  if (altitudeData.altitudeWorking >= 2.0f && !telemetry.flying)
   {
     if (++flyingCounter > 4) // make sure it is not a blip
     {
-      flying = true;
+      telemetry.flying = true;
       flyingCounter = 0;
     }
   }
@@ -472,16 +452,16 @@ inline void controlMixer()
   */
 
   // Quad mixing
-  m1_command_scaled = throttle_desired - pitch_PID + roll_PID + yaw_PID; // Front left
-  m2_command_scaled = throttle_desired - pitch_PID - roll_PID - yaw_PID; // Front right
-  m3_command_scaled = throttle_desired + pitch_PID - roll_PID + yaw_PID; // Back right
-  m4_command_scaled = throttle_desired + pitch_PID + roll_PID - yaw_PID; // Back left
+  motors.m1_command_scaled = pid.throttle_desired - pid.pitch_PID + pid.roll_PID + pid.yaw_PID; // Front left
+  motors.m2_command_scaled = pid.throttle_desired - pid.pitch_PID - pid.roll_PID - pid.yaw_PID; // Front right
+  motors.m3_command_scaled = pid.throttle_desired + pid.pitch_PID - pid.roll_PID + pid.yaw_PID; // Back right
+  motors.m4_command_scaled = pid.throttle_desired + pid.pitch_PID + pid.roll_PID - pid.yaw_PID; // Back left
 
   // Constrain outputs (final safety clamp, although it should never be more than 1 since they are all scaled)
-  m1_command_scaled = constrain(m1_command_scaled, 0.0f, 1.0f);
-  m2_command_scaled = constrain(m2_command_scaled, 0.0f, 1.0f);
-  m3_command_scaled = constrain(m3_command_scaled, 0.0f, 1.0f);
-  m4_command_scaled = constrain(m4_command_scaled, 0.0f, 1.0f);
+  motors.m1_command_scaled = constrain(motors.m1_command_scaled, 0.0f, 1.0f);
+  motors.m2_command_scaled = constrain(motors.m2_command_scaled, 0.0f, 1.0f);
+  motors.m3_command_scaled = constrain(motors.m3_command_scaled, 0.0f, 1.0f);
+  motors.m4_command_scaled = constrain(motors.m4_command_scaled, 0.0f, 1.0f);
 
   //ConditionCommands(); // Smooth ramping of motor speeds when launching and landing to prevent hard hits.
 }
@@ -491,46 +471,46 @@ inline void ConditionCommands()
   // This prevents sudden motor changes that could jolt the drone.
   // The ramp step controls how quickly motor commands can change per loop iteration.
 
-  if (m1_command_scaled_prev > m1_command_scaled + motor_ramp_step)
+  if (motors.m1_command_scaled_prev > motors.m1_command_scaled + motor_ramp_step)
   {
-    m1_command_scaled = m1_command_scaled_prev - motor_ramp_step;
+    motors.m1_command_scaled = motors.m1_command_scaled_prev - motor_ramp_step;
   }
-  else if (m1_command_scaled_prev < m1_command_scaled - motor_ramp_step)
+  else if (motors.m1_command_scaled_prev < motors.m1_command_scaled - motor_ramp_step)
   {
-    m1_command_scaled = m1_command_scaled_prev + motor_ramp_step;
-  }
-
-  if (m2_command_scaled_prev > m2_command_scaled + motor_ramp_step)
-  {
-    m2_command_scaled = m2_command_scaled_prev - motor_ramp_step;
-  }
-  else if (m2_command_scaled_prev < m2_command_scaled - motor_ramp_step)
-  {
-    m2_command_scaled = m2_command_scaled_prev + motor_ramp_step;
+    motors.m1_command_scaled = motors.m1_command_scaled_prev + motor_ramp_step;
   }
 
-  if (m3_command_scaled_prev > m3_command_scaled + motor_ramp_step)
+  if (motors.m2_command_scaled_prev > motors.m2_command_scaled + motor_ramp_step)
   {
-    m3_command_scaled = m3_command_scaled_prev - motor_ramp_step;
+    motors.m2_command_scaled = motors.m2_command_scaled_prev - motor_ramp_step;
   }
-  else if (m3_command_scaled_prev < m3_command_scaled - motor_ramp_step)
+  else if (motors.m2_command_scaled_prev < motors.m2_command_scaled - motor_ramp_step)
   {
-    m3_command_scaled = m3_command_scaled_prev + motor_ramp_step;
-  }
-
-  if (m4_command_scaled_prev > m4_command_scaled + motor_ramp_step)
-  {
-    m4_command_scaled = m4_command_scaled_prev - motor_ramp_step;
-  }
-  else if (m4_command_scaled_prev < m4_command_scaled - motor_ramp_step)
-  {
-    m4_command_scaled = m4_command_scaled_prev + motor_ramp_step;
+    motors.m2_command_scaled = motors.m2_command_scaled_prev + motor_ramp_step;
   }
 
-  m1_command_scaled_prev = m1_command_scaled;
-  m2_command_scaled_prev = m2_command_scaled;
-  m3_command_scaled_prev = m3_command_scaled;
-  m4_command_scaled_prev = m4_command_scaled;
+  if (motors.m3_command_scaled_prev > motors.m3_command_scaled + motor_ramp_step)
+  {
+    motors.m3_command_scaled = motors.m3_command_scaled_prev - motor_ramp_step;
+  }
+  else if (motors.m3_command_scaled_prev < motors.m3_command_scaled - motor_ramp_step)
+  {
+    motors.m3_command_scaled = motors.m3_command_scaled_prev + motor_ramp_step;
+  }
+
+  if (motors.m4_command_scaled_prev > motors.m4_command_scaled + motor_ramp_step)
+  {
+    motors.m4_command_scaled = motors.m4_command_scaled_prev - motor_ramp_step;
+  }
+  else if (motors.m4_command_scaled_prev < motors.m4_command_scaled - motor_ramp_step)
+  {
+    motors.m4_command_scaled = motors.m4_command_scaled_prev + motor_ramp_step;
+  }
+
+  motors.m1_command_scaled_prev = motors.m1_command_scaled;
+  motors.m2_command_scaled_prev = motors.m2_command_scaled;
+  motors.m3_command_scaled_prev = motors.m3_command_scaled;
+  motors.m4_command_scaled_prev = motors.m4_command_scaled;
 }
 
 void waitForRadio()
@@ -592,19 +572,19 @@ void setupMotorCommunication()
         ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timers[group]));
 
         mcpwm_gen_handle_t gen = NULL;
-        mcpwm_generator_config_t gen_config = { .gen_gpio_num = motor_pins[i] };
+        mcpwm_generator_config_t gen_config = { .gen_gpio_num = motors.motor_pins[i] };
         ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &gen));
 
         mcpwm_comparator_config_t comp_config = {};
         comp_config.flags.update_cmp_on_tez = true;
-        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &comparators[i]));
+        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &motors.comparators[i]));
 
-        mcpwm_comparator_set_compare_value(comparators[i], 1000);
+        mcpwm_comparator_set_compare_value(motors.comparators[i], 1000);
 
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(gen,
             MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(gen,
-            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW)));
+            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motors.comparators[i], MCPWM_GEN_ACTION_LOW)));
     }
 
     // Enable both
@@ -623,7 +603,7 @@ void setupMotorCommunication()
     Serial.println("MCPWM: Groups staggered using timed-start.");
     
     // Reset command values
-    m1_command_PWM = m2_command_PWM = m3_command_PWM = m4_command_PWM = 1000;
+    motors.m1_command_PWM = motors.m2_command_PWM = motors.m3_command_PWM = motors.m4_command_PWM = 1000;
     radioData.PWM_throttle = PWM_throttle_zero;
     radioData.PWM_roll     = PWM_roll_fs;
     radioData.PWM_pitch    = PWM_pitch_fs;
@@ -1150,7 +1130,7 @@ inline void resetAllTiming()
   unsigned long currentMicros = micros();
   lastMadgwickUpdateMicros = currentMicros; // Used for Madgwick delta time calculations
   PIDCounter = 0;                           // using ticks to keep everything in sync
-  ESCWriteCounter = 0;                      // using ticks to keep everything in sync
+  motors.ESCWriteCounter = 0;                      // using ticks to keep everything in sync
 }
 
 void PIDControlCalcs()
@@ -1167,16 +1147,16 @@ void PIDControlCalcs()
   if (radioData.PWM_throttle < 1520) // Reset the control if on the ground. This prevents integral windup and sudden jumps on takeoff.
   {
     integral_rate_roll = integral_rate_pitch = integral_rate_yaw = 0;
-    roll_PID = pitch_PID = yaw_PID = 0;
+    pid.roll_PID = pid.pitch_PID = pid.yaw_PID = 0;
     return;
   }
 
   if (configData.rateControlMode)
   {
-    desiredRateRoll = (roll_des-configData.trimRoll)/configData.maxRoll * rollLimits.maxRate;    // Between -500 and 500 deg/sec
-    desiredRatePitch =  (pitch_des-configData.trimPitch)/configData.maxPitch * pitchLimits.maxRate; // Between -500 and 500 deg/sec
-    desiredRateRoll = constrain(desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
-    desiredRatePitch = constrain(desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
+    pid.desiredRateRoll = (pid.roll_des-configData.trimRoll)/configData.maxRoll * rollLimits.maxRate;    // Between -500 and 500 deg/sec
+    pid.desiredRatePitch =  (pid.pitch_des-configData.trimPitch)/configData.maxPitch * pitchLimits.maxRate; // Between -500 and 500 deg/sec
+    pid.desiredRateRoll = constrain(pid.desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
+    pid.desiredRatePitch = constrain(pid.desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
   }
   else AngleLoopCalcs(); // Get the new desired angular rates based on current angle versus desired angle
 
@@ -1186,27 +1166,27 @@ void PIDControlCalcs()
   integral_rate_roll = constrain(integral_rate_roll, -configData.i_limit_rate, configData.i_limit_rate); // Think of this as the tracked energy required to achieve motor torque
 
   float derivative_roll = p;
-  roll_PID = configData.Kp_roll_rate * rateErrorRoll +
+  pid.roll_PID = configData.Kp_roll_rate * rateErrorRoll +
              configData.Ki_roll_rate * integral_rate_roll -
              configData.Kd_roll_rate * derivative_roll;
 
   // --- Pitch ---
-  float rateErrorPitch = desiredRatePitch - q;
+  float rateErrorPitch = pid.desiredRatePitch - q;
   integral_rate_pitch += rateErrorPitch * madDeltaTime;
   integral_rate_pitch = constrain(integral_rate_pitch, -configData.i_limit_rate, configData.i_limit_rate);
 
   float derivative_pitch = q;
-  pitch_PID = configData.Kp_pitch_rate * rateErrorPitch +
+  pid.pitch_PID = configData.Kp_pitch_rate * rateErrorPitch +
               configData.Ki_pitch_rate * integral_rate_pitch -
               configData.Kd_pitch_rate * derivative_pitch;
 
   // --- Yaw ---
-  float rateErrorYaw = yaw_des - r;
+  float rateErrorYaw = pid.yaw_des - r;
   integral_rate_yaw += rateErrorYaw * madDeltaTime;
   integral_rate_yaw = constrain(integral_rate_yaw, -configData.i_limit_rate, configData.i_limit_rate);
 
   float derivative_yaw = r;
-  yaw_PID = configData.Kp_yaw_rate * rateErrorYaw +
+  pid.yaw_PID = configData.Kp_yaw_rate * rateErrorYaw +
             configData.Ki_yaw_rate * integral_rate_yaw -
             configData.Kd_yaw_rate * derivative_yaw;
 }
@@ -1218,30 +1198,30 @@ void AngleLoopCalcs()
   static float integral_roll = 0.0f;
   static float integral_pitch = 0.0f;
 
-  if (++PIDCounter < (INNER_LOOP_FREQUENCY / PID_FREQ_HZ))
+  if (++pid.PIDCounter < (INNER_LOOP_FREQUENCY / PID_FREQ_HZ))
     return;
-  PIDCounter = 0;
+  pid.PIDCounter = 0;
 
   dt = micros() - lastTimeMicros;
   lastTimeMicros = micros();
 
   // --- Roll ---
-  float angleErrorRoll = roll_des - roll_IMU;
+  float angleErrorRoll = pid.roll_des - roll_IMU;
   integral_roll += angleErrorRoll * dt;
   integral_roll = constrain(integral_roll, -configData.i_limit_angle, configData.i_limit_angle);
 
-  desiredRateRoll = configData.Kp_roll_angle * angleErrorRoll +
+  pid.desiredRateRoll = configData.Kp_roll_angle * angleErrorRoll +
                     configData.Ki_roll_angle * integral_roll;
-  desiredRateRoll = constrain(desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
+  pid.desiredRateRoll = constrain(pid.desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
 
   // --- Pitch ---
-  float angleErrorPitch = pitch_des - pitch_IMU;
+  float angleErrorPitch = pid.pitch_des - pitch_IMU;
   integral_pitch += angleErrorPitch * dt;
   integral_pitch = constrain(integral_pitch, -configData.i_limit_angle, configData.i_limit_angle);
 
-  desiredRatePitch = configData.Kp_pitch_angle * angleErrorPitch +
+  pid.desiredRatePitch = configData.Kp_pitch_angle * angleErrorPitch +
                      configData.Ki_pitch_angle * integral_pitch;
-  desiredRatePitch = constrain(desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
+  pid.desiredRatePitch = constrain(pid.desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
 
   // --- Yaw setpoint comes directly from the stick --- //
 }
@@ -1339,10 +1319,10 @@ inline void getRadioStickValues()
     if (radioData.PWM_FailsafeSwitch < 1900) radioData.PWM_throttle = 1500; 
   }
 
-  if (radioData.PWM_throttle > highestThrottlePWM)
-    highestThrottlePWM = radioData.PWM_throttle;
-  else if (radioData.PWM_throttle < lowestThrottlePWM)
-    lowestThrottlePWM = radioData.PWM_throttle;
+  if (radioData.PWM_throttle > telemetry.highestThrottlePWM)
+    telemetry.highestThrottlePWM = radioData.PWM_throttle;
+  else if (radioData.PWM_throttle < telemetry.lowestThrottlePWM)
+    telemetry.lowestThrottlePWM = radioData.PWM_throttle;
 
   // Smoothing
   float coeff = (radioData.PWM_throttle > radioData.PWM_throttle_prev) ? configData.UP_COEFF : configData.DOWN_COEFF;
@@ -1453,12 +1433,12 @@ inline void setToFailsafe()
 
 inline void motorPipeline()
 {
-  ESCWriteCounter++;
+  motors.ESCWriteCounter++;
 
-  if (ESCWriteCounter < (INNER_LOOP_FREQUENCY / MOTOR_FREQ_HZ))
+  if (motors.ESCWriteCounter < (INNER_LOOP_FREQUENCY / MOTOR_FREQ_HZ))
     return;
 
-  ESCWriteCounter = 0;
+  motors.ESCWriteCounter = 0;
 
   controlMixer();            // Mixes PID outputs to scaled actuator commands -- custom mixing assignments done here
   scaleMotorCommandsToPWM(); // Scales motor commands from 0-1 to PWM
@@ -1470,17 +1450,17 @@ inline void commandMotors()
 {
     if (BENCH_TESTING)
     {
-      mcpwm_comparator_set_compare_value(comparators[0], 1000);
-      mcpwm_comparator_set_compare_value(comparators[1], 1000);
-      mcpwm_comparator_set_compare_value(comparators[2], 1000);
-      mcpwm_comparator_set_compare_value(comparators[3], 1000);
+      mcpwm_comparator_set_compare_value(motors.comparators[0], 1000);
+      mcpwm_comparator_set_compare_value(motors.comparators[1], 1000);
+      mcpwm_comparator_set_compare_value(motors.comparators[2], 1000);
+      mcpwm_comparator_set_compare_value(motors.comparators[3], 1000);
     }
     else
     {
-      mcpwm_comparator_set_compare_value(comparators[0], m1_command_PWM);
-      mcpwm_comparator_set_compare_value(comparators[1], m2_command_PWM);
-      mcpwm_comparator_set_compare_value(comparators[2], m3_command_PWM);
-      mcpwm_comparator_set_compare_value(comparators[3], m4_command_PWM);
+      mcpwm_comparator_set_compare_value(motors.comparators[0], motors.m1_command_PWM);
+      mcpwm_comparator_set_compare_value(motors.comparators[1], motors.m2_command_PWM);
+      mcpwm_comparator_set_compare_value(motors.comparators[2], motors.m3_command_PWM);
+      mcpwm_comparator_set_compare_value(motors.comparators[3], motors.m4_command_PWM);
     }
 }
 
@@ -1490,10 +1470,10 @@ inline void scaleMotorCommandsToPWM()
   // The actual pulse frame is set at the setupMotorCommunication.
   //
   // Scale to Servo PWM 1000-2000 microseconds for stop to full speed.  No need to constrain since mx_command_scaled already is.
-  m1_command_PWM = configData.throttleLimit * m1_command_scaled * 1000 + 1000;
-  m2_command_PWM = configData.throttleLimit * m2_command_scaled * 1000 + 1000;
-  m3_command_PWM = configData.throttleLimit * m3_command_scaled * 1000 + 1000;
-  m4_command_PWM = configData.throttleLimit * m4_command_scaled * 1000 + 1000;
+  motors.m1_command_PWM = configData.throttleLimit * motors.m1_command_scaled * 1000 + 1000;
+  motors.m2_command_PWM = configData.throttleLimit * motors.m2_command_scaled * 1000 + 1000;
+  motors.m3_command_PWM = configData.throttleLimit * motors.m3_command_scaled * 1000 + 1000;
+  motors.m4_command_PWM = configData.throttleLimit * motors.m4_command_scaled * 1000 + 1000;
 }
 /*
 inline void calibrateESCs()
@@ -1559,10 +1539,10 @@ void throttleCut()
           throttleNotCutCounter = 0;
           throttleCutCounter = 0;
           radioData.throttle_is_cut = false;
-          flying = false;
+          telemetry.flying = true;
           if (altitudeData.hasBMP581) xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
-          lowestThrottlePWM = 2000; // Reset for tracking highest and lowest throttle during flight
-          highestThrottlePWM = 1500;
+          telemetry.lowestThrottlePWM = 2000; // Reset for tracking highest and lowest throttle during flight
+          telemetry.highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
           altitudeData.fastestAscent = 0.0f;
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
@@ -1581,7 +1561,7 @@ void throttleCut()
     {
       radioData.throttle_is_cut = true;
       throttleCutCounter = 0;
-      flying = false;
+      telemetry.flying = false;
       killMotors();
     }
     return;
@@ -1599,7 +1579,7 @@ void throttleCut()
 
   if (altitudeData.hasBMP581)
   {
-    if (!flying && altitudeData.altitude < 2 && !BENCH_TESTING) // this is tip over protection at take-off
+    if (!telemetry.flying && altitudeData.altitude < 2 && !BENCH_TESTING) // this is tip over protection at take-off
     {
       if (roll_IMU > 15 || roll_IMU < -15 || pitch_IMU > 15 || pitch_IMU < -15)
       {
@@ -1629,14 +1609,14 @@ void killMotors()
 {
   // sets the PWM to its lowest value to shut off a motor such as when the throttle cut switch is flipped or it gets too steep of an angle.
   radioData.throttle_is_cut = true;
-  m1_command_PWM = 1000;      // This is milliseconds for PWM.  1000 is off. 2000 is full throttle.
-  m1_command_scaled_prev = 0; // This is 0 to 1.
-  m2_command_PWM = 1000;
-  m2_command_scaled_prev = 0;
-  m3_command_PWM = 1000;
-  m3_command_scaled_prev = 0;
-  m4_command_PWM = 1000;
-  m4_command_scaled_prev = 0;
+  motors.m1_command_PWM = 1000;      // This is milliseconds for PWM.  1000 is off. 2000 is full throttle.
+  motors.m1_command_scaled_prev = 0; // This is 0 to 1.
+  motors.m2_command_PWM = 1000;
+  motors.m2_command_scaled_prev = 0;
+  motors.m3_command_PWM = 1000;
+  motors.m3_command_scaled_prev = 0;
+  motors.m4_command_PWM = 1000;
+  motors.m4_command_scaled_prev = 0;
 }
 
 void tock()
@@ -1762,13 +1742,13 @@ void printJSON()
     Serial.print(configData.Kd_roll_rate);
 
     Serial.print(F(", \"m1\": "));
-    Serial.print(m1_command_PWM);
+    Serial.print(motors.m1_command_PWM);
     Serial.print(F(", \"m2\": "));
-    Serial.print(m2_command_PWM);
+    Serial.print(motors.m2_command_PWM);
     Serial.print(F(", \"m3\": "));
-    Serial.print(m3_command_PWM);
+    Serial.print(motors.m3_command_PWM);
     Serial.print(F(", \"m4\": "));
-    Serial.print(m4_command_PWM);
+    Serial.print(motors.m4_command_PWM);
 
     Serial.print(F(", \"AccX\": "));
     Serial.print(AccX);
@@ -1791,19 +1771,19 @@ void printJSON()
     Serial.print(yaw_IMU);
 
     Serial.print(F(", \"ThroDes\": "));
-    Serial.print(throttle_desired);
+    Serial.print(pid.throttle_desired);
     Serial.print(F(", \"RollDes\": "));
-    Serial.print(roll_des);
+    Serial.print(pid.roll_des);
     Serial.print(F(", \"PitchDes\": "));
-    Serial.print(pitch_des);
+    Serial.print(pid.pitch_des);
     Serial.print(F(", \"YawDes\": "));
-    Serial.print(yaw_des);
+    Serial.print(pid.yaw_des);
     Serial.print(F(", \"Pitch_PID\": "));
-    Serial.print(pitch_PID);
+    Serial.print(pid.pitch_PID);
     Serial.print(F(", \"Roll_PID\": "));
-    Serial.print(roll_PID);
+    Serial.print(pid.roll_PID);
     Serial.print(F(", \"Yaw_PID\": "));
-    Serial.print(yaw_PID);
+    Serial.print(pid.yaw_PID);
 
     Serial.print(F(", \"PWM_throttle\": "));
     Serial.print(radioData.PWM_throttle);
@@ -1836,11 +1816,11 @@ void printRollPitchYaw()
   {
     print_counter = micros();
     Serial.print(F("roll: "));
-    Serial.print(roll_IMU);
+    Serial.print(pid.roll_IMU);
     Serial.print(F(" pitch: "));
-    Serial.print(pitch_IMU);
+    Serial.print(pid.pitch_IMU);
     Serial.print(F(" yaw: "));
-    Serial.println(yaw_IMU);
+    Serial.println(pid.yaw_IMU);
   }
 }
 
@@ -1850,11 +1830,11 @@ void printPIDoutput()
   {
     print_counter = micros();
     Serial.print(F("roll_PID: "));
-    Serial.print(roll_PID);
+    Serial.print(pid.roll_PID);
     Serial.print(F(" pitch_PID: "));
-    Serial.print(pitch_PID);
+    Serial.print(pid.pitch_PID);
     Serial.print(F(" yaw_PID: "));
-    Serial.println(yaw_PID);
+    Serial.println(pid.yaw_PID);
   }
 }
 
@@ -1864,13 +1844,13 @@ void printMotorCommands()
   {
     print_counter = micros();
     Serial.print(F("m1_command: "));
-    Serial.print(m1_command_PWM);
+    Serial.print(motors.m1_command_PWM);
     Serial.print(F(" m2_command: "));
-    Serial.print(m2_command_PWM);
+    Serial.print(motors.m2_command_PWM);
     Serial.print(F(" m3_command: "));
-    Serial.print(m3_command_PWM);
+    Serial.print(motors.m3_command_PWM);
     Serial.print(F(" m4_command: "));
-    Serial.println(m4_command_PWM);
+    Serial.println(motors.m4_command_PWM);
   }
 }
 

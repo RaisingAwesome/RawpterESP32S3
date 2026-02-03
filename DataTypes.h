@@ -113,3 +113,36 @@ struct RadioData
   bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
   RmtPPMReader radio;
 };
+
+struct Motors
+{
+  // Motor Mixer
+  unsigned long ESCWriteCounter = 0;
+  float m1_command_scaled, m2_command_scaled, m3_command_scaled, m4_command_scaled;
+  float m1_command_scaled_prev, m2_command_scaled_prev, m3_command_scaled_prev, m4_command_scaled_prev;
+  int m1_command_PWM, m2_command_PWM, m3_command_PWM, m4_command_PWM;
+  
+  // Motor Electronic Speed Control Modules (ESC):
+  const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
+  mcpwm_cmpr_handle_t comparators[4];
+  static float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
+};
+
+struct PID
+{
+// PID Controllers:
+  float throttle_desired, roll_des, pitch_des, yaw_des; // Normalized desired state
+  float roll_PID = 0;
+  float pitch_PID = 0;
+  float yaw_PID = 0;
+  float desiredRateRoll, desiredRatePitch;
+  unsigned long PIDCounter = 0;
+};
+
+struct Telemetry
+{
+  //Telemetry
+static int16_t highestThrottlePWM = 1500;
+static int16_t lowestThrottlePWM = 2000;
+static bool flying = false;
+};
