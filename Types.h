@@ -10,7 +10,6 @@ struct Limits
   float maxRate =120; // deg/s
 };
 
-
 struct ConfigData
 {
   // Radio failsafe values for every channel in the event that bad reciever data is detected.
@@ -63,16 +62,6 @@ struct BatteryMonitor
   float calced_voltage = 14.8;
 };
 
-struct RadioData
-{
-  // Radio communication:
-  int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
-  int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
-  bool failsafed = false;
-  bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
-  RmtPPMReader radio;
-};
-
 struct PID
 {
 // PID Controllers:
@@ -96,6 +85,73 @@ struct Motors
   const int motor_pins[] = {m1Pin, m2Pin, m3Pin, m4Pin};
   mcpwm_cmpr_handle_t comparators[4];
   float motor_ramp_step = 1.0f / (RAMP_DURATION_SEC * MOTOR_FREQ_HZ);
+  void begin()
+  {
+    Serial.println("Initializing Split-Group MCPWM with Phase Shift...");
+
+    mcpwm_timer_handle_t timers[2] = {NULL, NULL};
+    uint32_t period = 1000000 / ESC_FREQ_HZ;
+    
+    for (int g = 0; g < 2; g++) {
+        mcpwm_timer_config_t timer_config = {};
+        timer_config.group_id = g;
+        timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
+        timer_config.resolution_hz = 1000000;
+        timer_config.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
+        timer_config.period_ticks = period;
+        ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[g]));
+    }
+
+    // --- PHASE SHIFT LOGIC ---
+    // Instead of chaining Group 0 to Group 1, we initialize them normally.
+    // To stagger them, we manually start Group 1 with an offset.
+    
+    for (int i = 0; i < 4; i++) {
+        int group = (i < 2) ? 0 : 1; 
+
+        mcpwm_oper_handle_t oper = NULL;
+        mcpwm_operator_config_t oper_config = { .group_id = group };
+        ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &oper));
+        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timers[group]));
+
+        mcpwm_gen_handle_t gen = NULL;
+        mcpwm_generator_config_t gen_config = { .gen_gpio_num = motors.motor_pins[i] };
+        ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &gen));
+
+        mcpwm_comparator_config_t comp_config = {};
+        comp_config.flags.update_cmp_on_tez = true;
+        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &motors.comparators[i]));
+
+        mcpwm_comparator_set_compare_value(motors.comparators[i], 1000);
+
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(gen,
+            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(gen,
+            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motors.comparators[i], MCPWM_GEN_ACTION_LOW)));
+    }
+
+    // Enable both
+    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[0]));
+    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[1]));
+
+    // Start Group 0 immediately
+    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[0], MCPWM_TIMER_START_NO_STOP));
+    
+    // DELAY start of Group 1 by half the period to stagger the current hit on changes
+    delayMicroseconds(period / 2); 
+    
+    // Start Group 1
+    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[1], MCPWM_TIMER_START_NO_STOP));
+
+    Serial.println("MCPWM: Groups staggered using timed-start.");
+    
+    // Reset command values
+    motors.m1_command_PWM = motors.m2_command_PWM = motors.m3_command_PWM = motors.m4_command_PWM = 1000;
+    PWM_throttle = PWM_throttle_zero;
+    PWM_roll     = PWM_roll_fs;
+    PWM_pitch    = PWM_pitch_fs;
+    PWM_yaw      = PWM_yaw_fs;
+  }
 };
 
 

@@ -25,6 +25,59 @@ struct AltitudeData
   float targetRateLanding = -0.1f; // ft/sec
   float upGain = 4.0f; // How hared to push back up if descend too quickly on landing
   float fastestAscent = 0.0f; // ft/sec
+
+  void begin(unsigned long failSafeThrottlePWM)
+  {
+    Serial.println("Setting up BMP581...");
+    sessionHoverPWM = failsafeThrottlePWM ; 
+    if (pressureSensor.beginI2C(i2cAddress) != BMP5_OK)
+    {
+      Serial.println("BMP581 not found!");
+      hasBMP581 = false;
+      return;
+    }
+    Serial.println("BMP581 discovered at address 0x46");
+
+    int8_t err = BMP5_OK;
+
+    // Set ODR directly
+    err = pressureSensor.setODRFrequency(BMP5_ODR_100_2_HZ);
+    if (err != BMP5_OK)
+    {
+      Serial.print("Error setting ODR! Error code: ");
+      Serial.println(err);
+      hasBMP581=false;
+      return;
+    }
+    else
+    {
+      Serial.println("BMP581 ODR set to 100 Hz (pressure only)");
+    }
+    bmp5_iir_config config;
+
+    // Configure IIR filters
+    config.set_iir_t = BMP5_IIR_FILTER_COEFF_1; // Minimal temp filtering
+    config.set_iir_p = BMP5_IIR_FILTER_COEFF_3; // 7 caused too much lag.
+    config.shdw_set_iir_t = BMP5_DISABLE;       // Don’t store temp data
+    config.shdw_set_iir_p = BMP5_ENABLE;        // Store filtered pressure
+    config.iir_flush_forced_en = BMP5_DISABLE;  // No forced flush
+
+    err = pressureSensor.setFilterConfig(&config);
+    vTaskDelay(100);
+    if (err != BMP5_OK)
+    {
+      Serial.print("Error setting filter config! Error code: ");
+      Serial.println(err);
+      hasBMP581 = false;
+      return;
+    }
+    else
+    {
+      Serial.println("BMP581 Filter configuration applied successfully.");
+    }
+    hasBMP581 = true;
+  }
+
 };
 
 // GPS
@@ -42,6 +95,57 @@ struct GPSData
   bool homeValid = false;
   double homePosLatitude = 0;
   double homePosLongitude = 0;
+
+  void begin {
+    delay(100);
+    if (!gps.Max10SGPS.begin(Wire))
+    {
+      Serial.println("u-blox GNSS not detected over I2C.");
+      gps.hasGPS = false;
+      return;
+    }
+
+    gps.hasGPS = true;
+    Serial.println("U-Blox GPS discovered.");
+    Serial.print("Firmware Version: ");
+    Serial.println(gps.Max10SGPS.getProtocolVersionHigh());
+    gps.Max10SGPS.setI2COutput(COM_TYPE_UBX);
+    gps.Max10SGPS.setNavigationFrequency(1);
+    gps.Max10SGPS.setAutoPVT(true);
+
+    Serial.println("TIMEPULSE configured: 1 Hz, 50% duty, always on.");
+
+    gps.Max10SGPS.newCfgValset(VAL_LAYER_RAM); 
+
+    // 1. Enable the pulse (Using your exact key)
+    gps.Max10SGPS.addCfgValset(0x10050007, 1); // CFG-TP-TP1_ENA
+
+    // 2. Set Pulse Definition to Period (0)
+    gps.Max10SGPS.addCfgValset(0x20050023, 0); // CFG-TP-PULSE_DEF
+
+    // 3. Set Length Definition to Length [us] (0)
+    gps.Max10SGPS.addCfgValset(0x20050030, 0); // CFG-TP-PULSE_LENGTH_DEF
+
+    // 4. Set Period to 1s (1,000,000 us)
+    gps.Max10SGPS.addCfgValset(0x40050002, 1000000); // CFG-TP-PERIOD_TP1
+
+    // 5. Set Length to 0.5s (500,000 us)
+    gps.Max10SGPS.addCfgValset(0x40050004, 500000);  // CFG-TP-LEN_TP1
+
+    // 6. Don't wait for GNSS Lock (Set to False/0)
+    // This is key ID 0x10050009 from your list
+    gps.Max10SGPS.addCfgValset(0x10050009, 0); // CFG-TP-USE_LOCKED_TP1
+
+    // 7. Polarity High (1)
+    gps.Max10SGPS.addCfgValset(0x1005000b, 1); // CFG-TP-POL_TP1
+
+    if (Max10SGPS.sendCfgValset()) {
+      Serial.println("Config sent. Searching for satellites...");
+    } else {
+      Serial.println("Problem: GPS Module could not be configured!");
+    }
+  }
+
 };
 
 struct IMU
@@ -342,6 +446,60 @@ struct IMU
     MadgwickInit(); // Initialize Madgwick filter with current accelerometer values
     Serial.println("IMU config complete.");
 }
+
+uint8_t readRegister(uint8_t reg)
+{
+  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
+  gpio_set_level((gpio_num_t)SPI_CS, 0);
+  IMUSPI.transfer(reg | 0x80); // Read bit set
+  uint8_t value = IMUSPI.transfer(0x00);
+  gpio_set_level((gpio_num_t)SPI_CS, 1);
+  IMUSPI.endTransaction();
+  return value;
+}
+
+int16_t read16(uint8_t reg)
+{
+  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
+  gpio_set_level((gpio_num_t)SPI_CS, 0);
+  IMUSPI.transfer(reg | 0x80); // Read bit set
+  uint8_t high = IMUSPI.transfer(0x00);
+  uint8_t low = IMUSPI.transfer(0x00);
+  gpio_set_level((gpio_num_t)SPI_CS, 1);
+  IMUSPI.endTransaction();
+  return (int16_t)((high << 8) | low);
+}
+
+inline void readBlock(uint8_t reg, uint8_t *buf, size_t len)
+{
+  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
+  // Assert chip select
+  gpio_set_level((gpio_num_t)SPI_CS, 0);
+
+  // Send register address with MSB=1 to indicate read
+  IMUSPI.transfer(reg | 0x80);
+
+  // Read 'len' bytes
+  for (size_t i = 0; i < len; i++)
+  {
+    buf[i] = IMUSPI.transfer(0x00); // dummy write, read response
+  }
+
+  // Deassert chip select
+  gpio_set_level((gpio_num_t)SPI_CS, 1);
+  IMUSPI.endTransaction();
+}
+
+void writeRegister(uint8_t reg, uint8_t value)
+{
+  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
+  gpio_set_level((gpio_num_t)SPI_CS, 0);
+  IMUSPI.transfer(reg & 0x7F); // Write bit
+  IMUSPI.transfer(value);
+  gpio_set_level((gpio_num_t)SPI_CS, 1);
+  IMUSPI.endTransaction();
+}
+
   /*
   void calculateIMUError()
   {

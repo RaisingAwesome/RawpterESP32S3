@@ -42,20 +42,21 @@ void setup()
 {
   // Bootup operations
   loopDroneHandle = xTaskGetCurrentTaskHandle(); // for messeging between tasks
-  setupSerial();             // Sets up both Serial and Serial1 for communication.
-  setupPPM();                // Setup the tas to detect PPM pulses from the RC Transmitter
-  setupMotorCommunication(); // Sets up hardware Motor Control PWM for commanding the motors
+  Serial.begin(2000000);     // Sets up for debug info.
+  radioData.radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
+  motors.begin(); // Sets up hardware Motor Control PWM for commanding the motors
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   setupPeripherals();        // Sets up I2C, ADC resolution, and any other peripherals needed
   setupBatteryMonitor();     // Sets up the ADC to monitor battery voltage
-  setupWiFi();               // Sets up the WiFi access point and web server
-  setupGPS();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
-  setupPressureSensor();     // Gets some default info and ensures their is a working BMP581 on board
+  WiFiBegin();               // Sets up the WiFi access point and web server
+  gps.begin();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
+  altitudeData.begin(configData.failsafeThrottlePWM);     // Gets some default info and ensures their is a working BMP581 on board
   imu.begin();                // Ensures there is a working IMU on board - it's imperative.
+  
   //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   
   playStartSong();
-  // motorTest(); //Used to check rotation on the bench. NO PROPS!
+
   if (!BENCH_TESTING)
   {
     Serial.println("Waiting for Radio");
@@ -67,10 +68,10 @@ void setup()
 
 void loop()
 {
-  tick();
-  syncAltitude();                           // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
-  getRadioStickValues();                    // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
-  imu.getIMUdata();                             // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  tick();                                   // Starts the loop pacing
+  syncSensors();                            // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
+  radioData.getRadioStickValues(altitudeData, telemetry.flying); // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
+  imu.getIMUdata();                         // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
@@ -96,7 +97,7 @@ void setupPeripherals()
   Wire.setClock(400000); // 400KhZ I2C
 }
 
-inline void syncAltitude()
+inline void syncSensors()
 { // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
   // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
@@ -237,149 +238,16 @@ void setAltitude()
 
 void troubleShooting()
 {
-  //  Lowest priority of the running tasks, so it won't slow anything down.  Could be used for logging or non-deadline type tasks.
-  //  Print data at 100hz (uncomment one at a time for troubleshooting)
-  //  printRadioData();     // Prints radio pwm values (expected: 1000 to 2000)
-  //  printDesiredState();  // Prints desired vehicle state commanded in either degrees or deg/sec (expected: +/- maxAXIS for roll, pitch, yaw; 0 to 1 for throttle)
-  //  printGyroData();      // Prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
-  //  printAccelData();     // Prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
-  //  printAltitude();      // Print the altitude from the BMP581.
-  //  printRollPitchYaw();  // Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
-  //  printPIDoutput();     // Prints computed stabilized PID variables from controller and desired setpoint (expected: ~ -1 to 1)
-  //  printMotorCommands(); // Prints the values being written to the motors (expected: 1000 to 2000)
-  //  printtock();      // Prints the time between loops in microseconds (expected: microseconds between inner loop iterations.  Set by DEFINES's)
-  //  printGPS();
   #if BENCH_TESTING
     printJSON();
   #endif
   //  printJSON();
 }
 
-void setupPressureSensor()
-{
-  Serial.println("Setting up BMP581...");
-  altitudeData.sessionHoverPWM = configData.failsafeThrottlePWM ; 
-  if (altitudeData.pressureSensor.beginI2C(altitudeData.i2cAddress) != BMP5_OK)
-  {
-    Serial.println("BMP581 not found!");
-    altitudeData.hasBMP581 = false;
-    return;
-  }
-  Serial.println("BMP581 discovered at address 0x46");
-
-  int8_t err = BMP5_OK;
-
-  // Set ODR directly
-  err = altitudeData.pressureSensor.setODRFrequency(BMP5_ODR_100_2_HZ);
-  if (err != BMP5_OK)
-  {
-    Serial.print("Error setting ODR! Error code: ");
-    Serial.println(err);
-    altitudeData.hasBMP581=false;
-    return;
-  }
-  else
-  {
-    Serial.println("BMP581 ODR set to 100 Hz (pressure only)");
-  }
-  bmp5_iir_config config;
-
-  // Configure IIR filters
-  config.set_iir_t = BMP5_IIR_FILTER_COEFF_1; // Minimal temp filtering
-  config.set_iir_p = BMP5_IIR_FILTER_COEFF_3; // 7 caused too much lag.
-  config.shdw_set_iir_t = BMP5_DISABLE;       // Don’t store temp data
-  config.shdw_set_iir_p = BMP5_ENABLE;        // Store filtered pressure
-  config.iir_flush_forced_en = BMP5_DISABLE;  // No forced flush
-
-  err = altitudeData.pressureSensor.setFilterConfig(&config);
-  vTaskDelay(100);
-  if (err != BMP5_OK)
-  {
-    Serial.print("Error setting filter config! Error code: ");
-    Serial.println(err);
-    altitudeData.hasBMP581 = false;
-    return;
-  }
-  else
-  {
-    Serial.println("BMP581 Filter configuration applied successfully.");
-  }
-  altitudeData.hasBMP581 = true;
-}
-
 void halt()
 {
   while (true)
     delay(100); // lock forever
-}
-
-void setupGPS() {
-  delay(100);
-  if (!gps.Max10SGPS.begin(Wire))
-  {
-    Serial.println("u-blox GNSS not detected over I2C.");
-    gps.hasGPS = false;
-    return;
-  }
-
-  gps.hasGPS = true;
-  Serial.println("U-Blox GPS discovered.");
-  Serial.print("Firmware Version: ");
-  Serial.println(gps.Max10SGPS.getProtocolVersionHigh());
-  gps.Max10SGPS.setI2COutput(COM_TYPE_UBX);
-  gps.Max10SGPS.setNavigationFrequency(1);
-  gps.Max10SGPS.setAutoPVT(true);
-
-  Serial.println("TIMEPULSE configured: 1 Hz, 50% duty, always on.");
-
-  gps.Max10SGPS.newCfgValset(VAL_LAYER_RAM); 
-
-  // 1. Enable the pulse (Using your exact key)
-  gps.Max10SGPS.addCfgValset(0x10050007, 1); // CFG-TP-TP1_ENA
-
-  // 2. Set Pulse Definition to Period (0)
-  gps.Max10SGPS.addCfgValset(0x20050023, 0); // CFG-TP-PULSE_DEF
-
-  // 3. Set Length Definition to Length [us] (0)
-  gps.Max10SGPS.addCfgValset(0x20050030, 0); // CFG-TP-PULSE_LENGTH_DEF
-
-  // 4. Set Period to 1s (1,000,000 us)
-  gps.Max10SGPS.addCfgValset(0x40050002, 1000000); // CFG-TP-PERIOD_TP1
-
-  // 5. Set Length to 0.5s (500,000 us)
-  gps.Max10SGPS.addCfgValset(0x40050004, 500000);  // CFG-TP-LEN_TP1
-
-  // 6. Don't wait for GNSS Lock (Set to False/0)
-  // This is key ID 0x10050009 from your list
-  gps.Max10SGPS.addCfgValset(0x10050009, 0); // CFG-TP-USE_LOCKED_TP1
-
-  // 7. Polarity High (1)
-  gps.Max10SGPS.addCfgValset(0x1005000b, 1); // CFG-TP-POL_TP1
-
-  if (gps.Max10SGPS.sendCfgValset()) {
-    Serial.println("Config sent. Searching for satellites...");
-  } else {
-    Serial.println("Problem: GPS Module could not be configured!");
-  }
-}
-
-void printGPS()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    gps.Max10SGPS.checkUblox(); // Process incoming data
-
-    if (gps.Max10SGPS.getInvalidLlh() == false)
-    {
-      Serial.print("Lat: ");
-      Serial.println(gps.Max10SGPS.getLatitude() / 1e7, 7);
-      Serial.print("Lon: ");
-      Serial.println(gps.Max10SGPS.getLongitude() / 1e7, 7);
-      Serial.print("Alt: ");
-      Serial.println(gps.Max10SGPS.getAltitude() / 1000.0, 2); // meters
-    }
-  }
 }
 
 inline void controlMixer()
@@ -479,18 +347,18 @@ void waitForRadio()
 {
   // Wait until the throttle is turned down and throttlecut switch is flipped down before allowing anything else to happen.
   // Using PWM_throttle_prev so that it is seeded
-  radioData.PWM_throttle_prev = getRadioPWM(throttlePin, 1520);
-  radioData.PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
-  radioData.PWM_FailsafeSwitch = getRadioPWM(failsafePin, 1000);
+  radioData.PWM_throttle_prev = radioData.getRadioPWM(throttlePin, 1520);
+  radioData.PWM_ThrottleCutSwitch = radioData.getRadioPWM(throttleCutSwitchPin, 2000);
+  radioData.PWM_FailsafeSwitch = radioData.getRadioPWM(failsafePin, 1000);
 
   while ((radioData.PWM_throttle_prev < 1400 || radioData.PWM_throttle_prev > 1519 || radioData.PWM_ThrottleCutSwitch > 1500 || radioData.PWM_FailsafeSwitch < 1500) && !BENCH_TESTING)
   { // Throttle Cut switch pulled down (flymode) is 2000. Up is 1000 (cut)
     // if the throttle is up or the cut switch is set to Fly (pulled down), then wait until the switches are set.
-    radioData.PWM_throttle_prev = getRadioPWM(throttlePin, 1520);              // keep it stuck in the loop if it failsafes
-    radioData.PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
-    radioData.PWM_FailsafeSwitch = getRadioPWM(failsafePin, 1000);
+    radioData.PWM_throttle_prev = radioData.getRadioPWM(throttlePin, 1520);              // keep it stuck in the loop if it failsafes
+    radioData.PWM_ThrottleCutSwitch = radioData.getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
+    radioData.PWM_FailsafeSwitch = radioData.getRadioPWM(failsafePin, 1000);
     tick();
-    getIMUdata();
+    altitudeData.getIMUdata();
     loopWiFi();
     tock(); // This will warm up the Madgwick while we wait for them to turn on the radio.
     vTaskDelay(1);
@@ -499,77 +367,9 @@ void waitForRadio()
   // Seed the rest of the controls' prev(ious) values.
   // This is so the filters don't have to climb up to their true values from zero at their startup
   // which throws off desired values for a brief time.
-  radioData.PWM_roll_prev = getRadioPWM(rollPin, 1500);
-  radioData.PWM_pitch_prev = getRadioPWM(pitchPin, 1500);
-  radioData.PWM_yaw_prev = getRadioPWM(yawPin, 1500);
-}
-
-void setupMotorCommunication()
-{
-    Serial.println("Initializing Split-Group MCPWM with Phase Shift...");
-
-    mcpwm_timer_handle_t timers[2] = {NULL, NULL};
-    uint32_t period = 1000000 / ESC_FREQ_HZ;
-    
-    for (int g = 0; g < 2; g++) {
-        mcpwm_timer_config_t timer_config = {};
-        timer_config.group_id = g;
-        timer_config.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
-        timer_config.resolution_hz = 1000000;
-        timer_config.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
-        timer_config.period_ticks = period;
-        ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timers[g]));
-    }
-
-    // --- PHASE SHIFT LOGIC ---
-    // Instead of chaining Group 0 to Group 1, we initialize them normally.
-    // To stagger them, we manually start Group 1 with an offset.
-    
-    for (int i = 0; i < 4; i++) {
-        int group = (i < 2) ? 0 : 1; 
-
-        mcpwm_oper_handle_t oper = NULL;
-        mcpwm_operator_config_t oper_config = { .group_id = group };
-        ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &oper));
-        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timers[group]));
-
-        mcpwm_gen_handle_t gen = NULL;
-        mcpwm_generator_config_t gen_config = { .gen_gpio_num = motors.motor_pins[i] };
-        ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &gen));
-
-        mcpwm_comparator_config_t comp_config = {};
-        comp_config.flags.update_cmp_on_tez = true;
-        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &comp_config, &motors.comparators[i]));
-
-        mcpwm_comparator_set_compare_value(motors.comparators[i], 1000);
-
-        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(gen,
-            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
-        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(gen,
-            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motors.comparators[i], MCPWM_GEN_ACTION_LOW)));
-    }
-
-    // Enable both
-    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[0]));
-    ESP_ERROR_CHECK(mcpwm_timer_enable(timers[1]));
-
-    // Start Group 0 immediately
-    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[0], MCPWM_TIMER_START_NO_STOP));
-    
-    // DELAY start of Group 1 by half the period to stagger the current hit on changes
-    delayMicroseconds(period / 2); 
-    
-    // Start Group 1
-    ESP_ERROR_CHECK(mcpwm_timer_start_stop(timers[1], MCPWM_TIMER_START_NO_STOP));
-
-    Serial.println("MCPWM: Groups staggered using timed-start.");
-    
-    // Reset command values
-    motors.m1_command_PWM = motors.m2_command_PWM = motors.m3_command_PWM = motors.m4_command_PWM = 1000;
-    radioData.PWM_throttle = PWM_throttle_zero;
-    radioData.PWM_roll     = PWM_roll_fs;
-    radioData.PWM_pitch    = PWM_pitch_fs;
-    radioData.PWM_yaw      = PWM_yaw_fs;
+  radioData.PWM_roll_prev = radioData.getRadioPWM(rollPin, 1500);
+  radioData.PWM_pitch_prev = radioData.getRadioPWM(pitchPin, 1500);
+  radioData.PWM_yaw_prev = radioData.getRadioPWM(yawPin, 1500);
 }
 
 void setupBatteryMonitor()
@@ -671,17 +471,6 @@ inline void loopBuzzer()
   }
 }
 
-void setupSerial()
-{
-  Serial.begin(2000000);
-  pinMode(44, INPUT);
-  Serial1.begin(9600, SERIAL_8N1, 44, 43);
-  delay(100);
-  Serial.println("USB and Pin Serial enabled...");
-  Serial1.println("USB and Pin Serial enabled...");
-  delay(100);
-}
-
 float getCalcedVoltage()
 {
   // For the battery voltage calc, you can use ohm's law on your chosen voltage divider resistors and get the voltage ratio of the 12bit ADC.
@@ -690,12 +479,6 @@ float getCalcedVoltage()
 
   return (((float)batteryMonitor.batteryVoltage * 0.0397) - 3.6127);
 }
-
-void setupPPM()
-{
-  radioData.radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
-}
-
 
 inline void getDesiredAnglesAndThrottleScaledToOne()
 {
@@ -820,131 +603,6 @@ void AngleLoopCalcs()
   pid.desiredRatePitch = constrain(pid.desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
 
   // --- Yaw setpoint comes directly from the stick --- //
-}
-
-inline void getRadioStickValues()
-{
-  static int throttleOverrideCounter = 0;
-  static bool landing = false;
-  static float integralAltitudeRate = 0 ;
-  static unsigned long landingTicks = 0;
-
-  // Read radio PWM
-  radioData.PWM_throttle = getRadioPWM(throttlePin, 1000);
-  radioData.PWM_roll = getRadioPWM(rollPin, 1500);
-  radioData.PWM_pitch = getRadioPWM(pitchPin, 1500);
-  radioData.PWM_yaw = getRadioPWM(yawPin, 1500);
-  radioData.PWM_ThrottleCutSwitch = getRadioPWM(throttleCutSwitchPin, 2000);
-  radioData.PWM_FailsafeSwitch = getRadioPWM(SwitchB, 1000);
-  
-  // Radio Receiver or Switch B is in Failsafe Mode - Land safely
-  // Also, only allow killMotors if flying to prevent a ground accident when worm burning.
-  
-  if (altitudeData.hasBMP581) 
-  {
-    if (radioData.PWM_FailsafeSwitch < 1900 /*landing*/ && flying)
-    {   
-        if (!landing)
-        {
-          landingTicks = 0.0f;
-          integralAltitudeRate = 0.0f; // reset integrator on landing start
-          throttleOverrideCounter = 0;
-          landing = true;
-          gps.atHome = false; // reset atHome flag to false to ensure heading home.
-        }
-        
-
-        if (landingTicks++ > 5000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
-        {
-          killMotors(); // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
-          landing=false;
-          return;
-        }
-        else
-        {
-            headHome(); // this will override pitch and roll PWM to head home if a GPS exists.
-            
-            if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
-            {
-                throttleOverrideCounter = 0;
-                float landingRate = altitudeData.targetRateLanding;
-                if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
-                {
-                    landingRate = 0.0f;
-                }
-                float rateError  = landingRate - altitudeData.rateFPS;
-                if (rateError > 0.5f && integralAltitudeRate < 0.0f)
-                {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
-                    integralAltitudeRate = 0.0f;
-                }
-                else if (rateError < 1.0f && integralAltitudeRate > 0.0f)
-                {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
-                    integralAltitudeRate = 0.0f;
-                }
-                // Integrator
-                integralAltitudeRate += rateError * 0.01f;  // 100 Hz is ticks at .01 seconds
-
-                // Don't accululate beyond PWM limits so you don't over saturate the integral.
-                float lowend  = -(altitudeData.sessionHoverPWM-1500) / altitudeData.ki_altitude_rate;
-                float highend =  (2000 - altitudeData.sessionHoverPWM) / (altitudeData.ki_altitude_rate);
-                integralAltitudeRate = constrain(integralAltitudeRate, lowend, highend);
-
-                // Asymmetric gain: more aggressive when descent is too fast (rateError > 0)
-                float upGain = (rateError > 0.0f) ? altitudeData.upGain : 1.0f;
-
-                float pwm = altitudeData.sessionHoverPWM
-                          + upGain * altitudeData.kp_altitude_rate * rateError
-                          + altitudeData.ki_altitude_rate * integralAltitudeRate;
-
-                radioData.PWM_throttle = constrain(pwm, 1500, 2000);
-            }
-            else
-            {
-                radioData.PWM_throttle = radioData.PWM_throttle_prev;
-            }
-        }
-    }
-    else 
-    {
-      throttleOverrideCounter = 0;
-      landing = false;
-    }
-  }
-  else
-  { // No altitude data, so just set throttle to minimum to prevent flyaways.
-    if (radioData.PWM_FailsafeSwitch < 1900) radioData.PWM_throttle = 1500; 
-  }
-
-  if (radioData.PWM_throttle > telemetry.highestThrottlePWM)
-    telemetry.highestThrottlePWM = radioData.PWM_throttle;
-  else if (radioData.PWM_throttle < telemetry.lowestThrottlePWM)
-    telemetry.lowestThrottlePWM = radioData.PWM_throttle;
-
-  // Smoothing
-  float coeff = (radioData.PWM_throttle > radioData.PWM_throttle_prev) ? configData.UP_COEFF : configData.DOWN_COEFF;
-  if (radioData.PWM_FailsafeSwitch < 1900) 
-  {
-    if (altitudeData.hasBMP581) 
-      coeff = 1.0f;
-    else
-      coeff = configData.failsafeCoeff; // Override the stick dampening to not mess up the PID loop
-  }
-  radioData.PWM_throttle = radioData.PWM_throttle_prev + coeff * (radioData.PWM_throttle - radioData.PWM_throttle_prev);
-  
-  // Bottom limit
-  if (radioData.PWM_throttle < 1500)
-    radioData.PWM_throttle = 1500;
-
-  // Stick dampening (optimized form)
-  radioData.PWM_roll = radioData.PWM_roll_prev + configData.stick_dampener * (radioData.PWM_roll - radioData.PWM_roll_prev);
-  radioData.PWM_pitch = radioData.PWM_pitch_prev + configData.stick_dampener * (radioData.PWM_pitch - radioData.PWM_pitch_prev);
-  radioData.PWM_yaw = radioData.PWM_yaw_prev + configData.stick_dampener * (radioData.PWM_yaw - radioData.PWM_yaw_prev);
-
-  // Update prevs
-  radioData.PWM_throttle_prev = radioData.PWM_throttle;
-  radioData.PWM_roll_prev = radioData.PWM_roll;
-  radioData.PWM_pitch_prev = radioData.PWM_pitch;
-  radioData.PWM_yaw_prev = radioData.PWM_yaw;
 }
 
 inline void headHome()
@@ -1240,84 +898,6 @@ void tock()
     resetAllTiming(); // Resets the counters that keep the beat for outer loops
 }
 
-void printRadioData()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F(" CH1: ")); // Roll
-    Serial.print(getRadioPWM(1, 24));
-    Serial.print(F(" CH2: ")); // Pitch
-    Serial.print(getRadioPWM(2, 24));
-    Serial.print(F(" CH3: "));
-    Serial.print(getRadioPWM(3, 24)); // Throttle
-    Serial.print(F(" CH4: "));
-    Serial.print(getRadioPWM(4, 24)); // Yaw
-    Serial.print(F(" CH5: "));
-    Serial.println(getRadioPWM(5, 24));
-    Serial.print(F(" CH6: "));
-    Serial.println(getRadioPWM(6, 24));
-  }
-}
-
-void printDesiredState()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("throttle_desired: "));
-    Serial.print(throttle_desired);
-    Serial.print(F(" roll_des: "));
-    Serial.print(roll_des);
-    Serial.print(F(" pitch_des: "));
-    Serial.print(pitch_des);
-    Serial.print(F(" yaw_des: "));
-    Serial.println(yaw_des);
-  }
-}
-
-void printGyroData()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("GyroX: "));
-    Serial.print(imu.GyroX);
-    Serial.print(F(" GyroY: "));
-    Serial.print(imu.GyroY);
-    Serial.print(F(" GyroZ: "));
-    Serial.println(imu.GyroZ);
-  }
-}
-
-void printAccelData()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("AccX: "));
-    Serial.print(AccX);
-    Serial.print(F(" AccY: "));
-    Serial.print(AccY);
-    Serial.print(F(" AccZ: "));
-    Serial.println(AccZ);
-  }
-}
-
-void printAltitude()
-{
-  if (tick_time - print_counter > 100000)
-  {
-    print_counter = micros();
-    Serial.print(F("Altitude: "));
-    Serial.print(altitudeData.altitude,4);
-    Serial.print(F("  Altitude Rate: "));
-    Serial.print(altitudeData.rateFPS,4);
-    Serial.print(F("  Delta Time:"));
-    Serial.println(madDeltaTime * 1000000.0);
-  }
-}
-
 void printJSON()
 {
   if (tick_time - print_counter > 10000)
@@ -1405,120 +985,7 @@ void printJSON()
   }
 }
 
-void printRollPitchYaw()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("roll: "));
-    Serial.print(imu.roll_IMU);
-    Serial.print(F(" pitch: "));
-    Serial.print(imu.pitch_IMU);
-    Serial.print(F(" yaw: "));
-    Serial.println(imu.yaw_IMU);
-  }
-}
-
-void printPIDoutput()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("roll_PID: "));
-    Serial.print(pid.roll_PID);
-    Serial.print(F(" pitch_PID: "));
-    Serial.print(pid.pitch_PID);
-    Serial.print(F(" yaw_PID: "));
-    Serial.println(pid.yaw_PID);
-  }
-}
-
-void printMotorCommands()
-{
-  if (tick_time - print_counter > 10000)
-  {
-    print_counter = micros();
-    Serial.print(F("m1_command: "));
-    Serial.print(motors.m1_command_PWM);
-    Serial.print(F(" m2_command: "));
-    Serial.print(motors.m2_command_PWM);
-    Serial.print(F(" m3_command: "));
-    Serial.print(motors.m3_command_PWM);
-    Serial.print(F(" m4_command: "));
-    Serial.println(motors.m4_command_PWM);
-  }
-}
-
-void printtock()
-{
-  if (tick_time - print_counter > 50000)
-  {
-    print_counter = micros();
-    Serial.print(F("inner microseconds = "));
-    Serial.print(innerLoopMicroseconds);
-    Serial.print(F("   deltaTime = "));
-    Serial.println(madDeltaTime * 1000000.0);
-    
-  }
-}
-
-// ========================================================================================================================//
-// PPM routines
-int16_t getRadioPWM(int ch_num, int16_t defaultVal)
-{
-  // DESCRIPTION: Get current radio commands from interrupt routine
-
-  int16_t valPWM = 0;
-  valPWM = latestValidChannelValue(ch_num, defaultVal); // 1000-2000 based on PPM routine return range. Return defaultVal if it isn't valid.
-  return valPWM;
-}
-
-inline int16_t latestValidChannelValue(uint8_t  channel, int16_t defaultValue) {
-  // Capture current time once
-  static unsigned minChannelPWMValue = 900;       // Used to determine if a channels reported pulse width is realistically valid.
-  static unsigned maxChannelPWMValue = 2100;      // Used to determine if a channels reported pulse width is realistically valid.
-  static unsigned long failsafeTimeout = 500000L; // The timeout (microseconds) after which the channels which were not updated are considered invalid
-  static bool failsafeTriggered = false;
-  static unsigned long failsafeTime = 0;
-  unsigned long currentMicros = micros();
-
-  int16_t value = defaultValue;
-  bool invalid = true;
-  
-  // Valid channel and within timeout?
-  if (channel >= 1 && channel <= CHANNELS) {    
-    uint32_t raw = radioData.radio.getChannel(channel - 1);
-    if (raw >= minChannelPWMValue && raw <= maxChannelPWMValue) {
-      value = (int16_t) raw;
-      invalid = false;
-      failsafeTriggered = false;
-      radioData.failsafed = false;
-      return value;
-    }
-  } else return 0;
-
-  if (invalid) {
-    if (!failsafeTriggered) {
-      failsafeTriggered = true;
-      failsafeTime = currentMicros;
-    } else {
-      // Elapsed time since failsafe triggered
-      if (currentMicros - failsafeTime > 500000UL) {  // 0.5 seconds
-        if (!radioData.failsafed) {
-          setToFailsafe();
-          radioData.failsafed = true;
-        }
-      }
-    }
-  } else {
-    failsafeTriggered = false;
-    radioData.failsafed = false;
-  }
-
-  return value;
-}
-
-void setupWiFi()
+void WiFiBegin()
 {
   const char *ssid = "_Rawpter";
   const char *pass = "12345678";
@@ -1778,59 +1245,6 @@ void setValuesFromUserForm(String req)
   }
 }
 
-uint8_t readRegister(uint8_t reg)
-{
-  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
-  gpio_set_level((gpio_num_t)SPI_CS, 0);
-  IMUSPI.transfer(reg | 0x80); // Read bit set
-  uint8_t value = IMUSPI.transfer(0x00);
-  gpio_set_level((gpio_num_t)SPI_CS, 1);
-  IMUSPI.endTransaction();
-  return value;
-}
-
-int16_t read16(uint8_t reg)
-{
-  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
-  gpio_set_level((gpio_num_t)SPI_CS, 0);
-  IMUSPI.transfer(reg | 0x80); // Read bit set
-  uint8_t high = IMUSPI.transfer(0x00);
-  uint8_t low = IMUSPI.transfer(0x00);
-  gpio_set_level((gpio_num_t)SPI_CS, 1);
-  IMUSPI.endTransaction();
-  return (int16_t)((high << 8) | low);
-}
-
-inline void readBlock(uint8_t reg, uint8_t *buf, size_t len)
-{
-  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
-  // Assert chip select
-  gpio_set_level((gpio_num_t)SPI_CS, 0);
-
-  // Send register address with MSB=1 to indicate read
-  IMUSPI.transfer(reg | 0x80);
-
-  // Read 'len' bytes
-  for (size_t i = 0; i < len; i++)
-  {
-    buf[i] = IMUSPI.transfer(0x00); // dummy write, read response
-  }
-
-  // Deassert chip select
-  gpio_set_level((gpio_num_t)SPI_CS, 1);
-  IMUSPI.endTransaction();
-}
-
-void writeRegister(uint8_t reg, uint8_t value)
-{
-  IMUSPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0)); // 1 MHz, Mode 0
-  gpio_set_level((gpio_num_t)SPI_CS, 0);
-  IMUSPI.transfer(reg & 0x7F); // Write bit
-  IMUSPI.transfer(value);
-  gpio_set_level((gpio_num_t)SPI_CS, 1);
-  IMUSPI.endTransaction();
-}
-
 void saveParameters()
 {
   configData.throttleLimit = constrain(configData.throttleLimit,0.0,1.0); //protect from a fat finger
@@ -2073,29 +1487,3 @@ void GenerateDefaultPage(WiFiClient &client)
   client.write((const uint8_t *)body.c_str(), body.length());  
   if (BENCH_TESTING) Serial.println("Made Web Page.");
 }
-
-/*
-void motorTest()
-{ 
-    // Used to check rotation on the bench. NO PROPS!
-    return;
-
-    for (int ii = 0; ii < 5; ii++)
-    {
-        // Idle (1000 µs)
-        mcpwm_comparator_set_compare_value(cmp_m1, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m2, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m3, 1000);
-        mcpwm_comparator_set_compare_value(cmp_m4, 1000);
-        delay(2000);
-
-        // Slight throttle (1100 µs)
-        mcpwm_comparator_set_compare_value(cmp_m1, 1100);
-        mcpwm_comparator_set_compare_value(cmp_m2, 1100);
-        mcpwm_comparator_set_compare_value(cmp_m3, 1100);
-        mcpwm_comparator_set_compare_value(cmp_m4, 1100);
-        delay(2000);
-    }
-}
-
-*/
