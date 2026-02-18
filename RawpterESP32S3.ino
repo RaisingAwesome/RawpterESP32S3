@@ -6,10 +6,8 @@
 #include "Project.h"
 
 constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
-
-// ========================================================================================================================//
-//                                               USER-SPECIFIED VARIABLES                                                 //
-// ========================================================================================================================//
+constexpr bool CALIBRATE_ESCS = false; // used for bench calibration - be careful!!!!
+constexpr bool CALCULATE_IMU_ERROR = false; // used to generate the error parameters
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
 AltitudeData altitudeData{};
@@ -20,10 +18,10 @@ Limits rollLimits = {160.0f};
 Limits pitchLimits = {160.0f};
 BatteryMonitor batteryMonitor{};
 RadioData radioData{};
-Motors motors{};
+RawpterMotors motors(radioData);
 PID pid{};
-Telemetry telemetry{};
-IMU imu{};
+RawpterTelemetry telemetry{};
+RawpterIMU imu{};
 
 // General stuff for controlling timing of things
 unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
@@ -43,8 +41,9 @@ void setup()
   // Bootup operations
   loopDroneHandle = xTaskGetCurrentTaskHandle(); // for messeging between tasks
   Serial.begin(2000000);     // Sets up for debug info.
-  radioData.radio.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
+  radioData.begin(PPM_PIN, 1000000, 8, 2100); // GPIO Pin Number, 1MZ (1uS ticks) to track PPM pulse width, # of pulses in PPM, duration of sync high pulse
   motors.begin(); // Sets up hardware Motor Control PWM for commanding the motors
+  if (CALIBRATE_ESCS) calibrateESCs();
   loadParameters();          // overrides coded parameters with the last stored on the chip or defaults if none exist.
   setupPeripherals();        // Sets up I2C, ADC resolution, and any other peripherals needed
   setupBatteryMonitor();     // Sets up the ADC to monitor battery voltage
@@ -52,17 +51,15 @@ void setup()
   gps.begin();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
   altitudeData.begin(configData.failsafeThrottlePWM);     // Gets some default info and ensures their is a working BMP581 on board
   imu.begin();                // Ensures there is a working IMU on board - it's imperative.
+  if (CALCULATE_IMU_ERROR) imu.calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   
-  //calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
-  
-  playStartSong();
-
   if (!BENCH_TESTING)
   {
+    playStartSong();
     Serial.println("Waiting for Radio");
     waitForRadio();
   }
-    Serial.println("Ready...");
+  Serial.println("Ready...");
   if (altitudeData.hasBMP581) beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
 }
 
@@ -70,13 +67,13 @@ void loop()
 {
   tick();                                   // Starts the loop pacing
   syncSensors();                            // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
-  radioData.getRadioStickValues(altitudeData, telemetry.flying); // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
-  imu.getIMUdata();                         // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  radioData.getRadioStickValues(altitudeData, gps, telemetry, configData, imu); // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
+  imu.getIMUdata(configData);              // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
   tock();                                   // Yields until the end of the the inner loop pacing
-  //troubleShooting();
+  if (BENCH_TESTING) printJSON();
 }
 
 inline void tick()
@@ -236,20 +233,6 @@ void setAltitude()
   }
 }
 
-void troubleShooting()
-{
-  #if BENCH_TESTING
-    printJSON();
-  #endif
-  //  printJSON();
-}
-
-void halt()
-{
-  while (true)
-    delay(100); // lock forever
-}
-
 inline void controlMixer()
 {
   // DESCRIPTION: Mixes scaled commands from PID controller to actuator outputs based on vehicle configuration
@@ -301,40 +284,40 @@ inline void ConditionCommands()
   // This prevents sudden motor changes that could jolt the drone.
   // The ramp step controls how quickly motor commands can change per loop iteration.
 
-  if (motors.m1_command_scaled_prev > motors.m1_command_scaled + motor_ramp_step)
+  if (motors.m1_command_scaled_prev > motors.m1_command_scaled + motors.motor_ramp_step)
   {
-    motors.m1_command_scaled = motors.m1_command_scaled_prev - motor_ramp_step;
+    motors.m1_command_scaled = motors.m1_command_scaled_prev - motors.motor_ramp_step;
   }
-  else if (motors.m1_command_scaled_prev < motors.m1_command_scaled - motor_ramp_step)
+  else if (motors.m1_command_scaled_prev < motors.m1_command_scaled - motors.motor_ramp_step)
   {
-    motors.m1_command_scaled = motors.m1_command_scaled_prev + motor_ramp_step;
-  }
-
-  if (motors.m2_command_scaled_prev > motors.m2_command_scaled + motor_ramp_step)
-  {
-    motors.m2_command_scaled = motors.m2_command_scaled_prev - motor_ramp_step;
-  }
-  else if (motors.m2_command_scaled_prev < motors.m2_command_scaled - motor_ramp_step)
-  {
-    motors.m2_command_scaled = motors.m2_command_scaled_prev + motor_ramp_step;
+    motors.m1_command_scaled = motors.m1_command_scaled_prev + motors.motor_ramp_step;
   }
 
-  if (motors.m3_command_scaled_prev > motors.m3_command_scaled + motor_ramp_step)
+  if (motors.m2_command_scaled_prev > motors.m2_command_scaled + motors.motor_ramp_step)
   {
-    motors.m3_command_scaled = motors.m3_command_scaled_prev - motor_ramp_step;
+    motors.m2_command_scaled = motors.m2_command_scaled_prev - motors.motor_ramp_step;
   }
-  else if (motors.m3_command_scaled_prev < motors.m3_command_scaled - motor_ramp_step)
+  else if (motors.m2_command_scaled_prev < motors.m2_command_scaled - motors.motor_ramp_step)
   {
-    motors.m3_command_scaled = motors.m3_command_scaled_prev + motor_ramp_step;
+    motors.m2_command_scaled = motors.m2_command_scaled_prev + motors.motor_ramp_step;
   }
 
-  if (motors.m4_command_scaled_prev > motors.m4_command_scaled + motor_ramp_step)
+  if (motors.m3_command_scaled_prev > motors.m3_command_scaled + motors.motor_ramp_step)
   {
-    motors.m4_command_scaled = motors.m4_command_scaled_prev - motor_ramp_step;
+    motors.m3_command_scaled = motors.m3_command_scaled_prev - motors.motor_ramp_step;
   }
-  else if (motors.m4_command_scaled_prev < motors.m4_command_scaled - motor_ramp_step)
+  else if (motors.m3_command_scaled_prev < motors.m3_command_scaled - motors.motor_ramp_step)
   {
-    motors.m4_command_scaled = motors.m4_command_scaled_prev + motor_ramp_step;
+    motors.m3_command_scaled = motors.m3_command_scaled_prev + motors.motor_ramp_step;
+  }
+
+  if (motors.m4_command_scaled_prev > motors.m4_command_scaled + motors.motor_ramp_step)
+  {
+    motors.m4_command_scaled = motors.m4_command_scaled_prev - motors.motor_ramp_step;
+  }
+  else if (motors.m4_command_scaled_prev < motors.m4_command_scaled - motors.motor_ramp_step)
+  {
+    motors.m4_command_scaled = motors.m4_command_scaled_prev + motors.motor_ramp_step;
   }
 
   motors.m1_command_scaled_prev = motors.m1_command_scaled;
@@ -358,7 +341,7 @@ void waitForRadio()
     radioData.PWM_ThrottleCutSwitch = radioData.getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
     radioData.PWM_FailsafeSwitch = radioData.getRadioPWM(failsafePin, 1000);
     tick();
-    altitudeData.getIMUdata();
+    imu.getIMUdata(configData);
     loopWiFi();
     tock(); // This will warm up the Madgwick while we wait for them to turn on the radio.
     vTaskDelay(1);
@@ -445,7 +428,7 @@ inline void loopBuzzer()
   static unsigned long buzzer_millis = millis();
   unsigned long myTime = millis();
   
-  if (playingSong) return;
+  if (playingSong||BENCH_TESTING) return;
   if (radioData.PWM_FailsafeSwitch < 1500)
     buzzer_spacing = 100;
   else 
@@ -490,16 +473,16 @@ inline void getDesiredAnglesAndThrottleScaledToOne()
    * yaw_des is scaled to be within max yaw in degrees/sec.
    */
 
-  throttle_desired = (radioData.PWM_throttle - 1500.0f) / 500.0f;   // Between  0 and 1 because anything under 1500 will be set to 1500 for now.
-  roll_des = (radioData.PWM_roll - 1500.0f + configData.trimRoll) / 500.0f;    // Between -1 and 1
-  pitch_des = (radioData.PWM_pitch - 1500.0f + configData.trimPitch) / 500.0f; // Between -1 and 1
-  yaw_des = -(radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
+  pid.throttle_desired = (radioData.PWM_throttle - 1500.0f) / 500.0f;   // Between  0 and 1 because anything under 1500 will be set to 1500 for now.
+  pid.roll_des = (radioData.PWM_roll - 1500.0f + configData.trimRoll) / 500.0f;    // Between -1 and 1
+  pid.pitch_des = (radioData.PWM_pitch - 1500.0f + configData.trimPitch) / 500.0f; // Between -1 and 1
+  pid.yaw_des = -(radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
 
   // Constrain within normalized bounds
-  throttle_desired = constrain(throttle_desired, 0.0f, 1.0f); // Between 0 and 1
-  roll_des = constrain(roll_des, -1.0f, 1.0f) * configData.maxRoll;      // Between -maxRoll and +maxRoll
-  pitch_des = constrain(pitch_des, -1.0f, 1.0f) * configData.maxPitch;   // Between -maxPitch and +maxPitch
-  yaw_des = constrain(yaw_des, -1.0f, 1.0f) * configData.maxYaw;         // Between -maxYaw and +maxYaw
+  pid.throttle_desired = constrain(pid.throttle_desired, 0.0f, 1.0f); // Between 0 and 1
+  pid.roll_des = constrain(pid.roll_des, -1.0f, 1.0f) * configData.maxRoll;      // Between -maxRoll and +maxRoll
+  pid.pitch_des = constrain(pid.pitch_des, -1.0f, 1.0f) * configData.maxPitch;   // Between -maxPitch and +maxPitch
+  pid.yaw_des = constrain(pid.yaw_des, -1.0f, 1.0f) * configData.maxYaw;         // Between -maxYaw and +maxYaw
 }
 
 inline void resetAllTiming()
@@ -509,7 +492,7 @@ inline void resetAllTiming()
   unsigned long currentMicros = micros();
   imu.lastMadgwickUpdateMicros = currentMicros; // Used for Madgwick delta time calculations
   pid.PIDCounter = 0;                           // using ticks to keep everything in sync
-  motors.ESCWriteCounter = 0;                      // using ticks to keep everything in sync
+  motors.ESCWriteCounter = 0;                   // using ticks to keep everything in sync
 }
 
 void PIDControlCalcs()
@@ -541,7 +524,7 @@ void PIDControlCalcs()
 
   // --- Roll ---
   float rateErrorRoll = pid.desiredRateRoll - p;
-  integral_rate_roll += rateErrorRoll * madDeltaTime;
+  integral_rate_roll += rateErrorRoll * imu.madDeltaTime;
   integral_rate_roll = constrain(integral_rate_roll, -configData.i_limit_rate, configData.i_limit_rate); // Think of this as the tracked energy required to achieve motor torque
 
   float derivative_roll = p;
@@ -551,7 +534,7 @@ void PIDControlCalcs()
 
   // --- Pitch ---
   float rateErrorPitch = pid.desiredRatePitch - q;
-  integral_rate_pitch += rateErrorPitch * madDeltaTime;
+  integral_rate_pitch += rateErrorPitch * imu.madDeltaTime;
   integral_rate_pitch = constrain(integral_rate_pitch, -configData.i_limit_rate, configData.i_limit_rate);
 
   float derivative_pitch = q;
@@ -561,7 +544,7 @@ void PIDControlCalcs()
 
   // --- Yaw ---
   float rateErrorYaw = pid.yaw_des - r;
-  integral_rate_yaw += rateErrorYaw * madDeltaTime;
+  integral_rate_yaw += rateErrorYaw * imu.madDeltaTime;
   integral_rate_yaw = constrain(integral_rate_yaw, -configData.i_limit_rate, configData.i_limit_rate);
 
   float derivative_yaw = r;
@@ -605,86 +588,6 @@ void AngleLoopCalcs()
   // --- Yaw setpoint comes directly from the stick --- //
 }
 
-inline void headHome()
-{
-    // ---------------- HORIZONTAL RTL ----------------
-    if (gps.useGPS)
-    {
-        float errN, errE;
-
-        gpsErrorToNE(gps.latitude, gps.longitude,
-                     gps.homePosLatitude, gps.homePosLongitude,
-                     errN, errE);
-
-        float dist2 = errN*errN + errE*errE;
-
-        if (dist2 > 1.0f)   // more than ~1 m away
-        {
-            // --- Rotate world-frame error into body-frame using yaw ---
-            // yaw from Madgwick (radians)
-            float psi = -yaw_IMU * 0.01745329252f;
-
-            float c = cosf(psi);
-            float s = sinf(psi);
-
-            // Body-frame forward/right errors
-            float e_forward =  c * errN + s * errE;   // +forward means home is ahead
-            float e_right   = -s * errN + c * errE;   // +right means home is to the right
-
-            // Convert body-frame error → stick PWM
-            float pitchOffset = -configData.K_pos2pwm * e_forward;  // forward error → pitch forward
-            float rollOffset  =  configData.K_pos2pwm * e_right;    // right error → roll right
-
-            float pitchCmd = 1500.0f + pitchOffset;
-            float rollCmd  = 1500.0f + rollOffset;
-
-            pitchCmd = constrain(pitchCmd, 1300.0f, 1700.0f);
-            rollCmd  = constrain(rollCmd, 1300.0f, 1700.0f);
-
-            gps.atHome = false;
-            radioData.PWM_pitch = pitchCmd;
-            radioData.PWM_roll  = rollCmd;
-        }
-        else
-        {
-            // Close enough to home → level out
-            radioData.PWM_pitch = 1500;
-            radioData.PWM_roll  = 1500;
-            gps.atHome = true;
-        }
-    }
-}
-
-void gpsErrorToNE(double lat_now, double lon_now,
-                         double lat_home, double lon_home,
-                         float &errN_m, float &errE_m)
-{
-    const double deg2rad = 0.017453292519943295;
-    double dLat = (lat_home - lat_now) * deg2rad;
-    double dLon = (lon_home - lon_now) * deg2rad;
-    double latRad = lat_now * deg2rad;
-
-    double R = 6378137.0; // Earth radius
-    errN_m = (float)(R * dLat);
-    errE_m = (float)(R * cos(latRad) * dLon);
-}
-
-inline void setToFailsafe()
-{
-  // This would only be called if the receiver itself had a major problem or is not set to failsafe
-  // in it's failsafe settings. If it loses
-  // connection, it gives its own failsafe value. To signal a failsafe state, the
-  // receiver must be setup to failsafe switchB to 2000 to flag the break of connection.
-  // With that, this would not be called. It only gets called if there is no valid value at all.
-  // That's bad news and so this routine basically drops it from the sky as it would be in a hopeless state.
-  radioData.PWM_throttle = PWM_throttle_fs;
-  radioData.PWM_roll = PWM_roll_fs;
-  radioData.PWM_pitch = PWM_pitch_fs;
-  radioData.PWM_yaw = PWM_yaw_fs;
-  radioData.PWM_ThrottleCutSwitch = PWM_ThrottleCutSwitch_fs;
-  radioData.PWM_FailsafeSwitch = PWM_FailsafeSwitch_fs;
-}
-
 inline void motorPipeline()
 {
   motors.ESCWriteCounter++;
@@ -704,17 +607,18 @@ inline void commandMotors()
 {
     if (BENCH_TESTING)
     {
-      mcpwm_comparator_set_compare_value(motors.comparators[0], 1000);
-      mcpwm_comparator_set_compare_value(motors.comparators[1], 1000);
-      mcpwm_comparator_set_compare_value(motors.comparators[2], 1000);
-      mcpwm_comparator_set_compare_value(motors.comparators[3], 1000);
+      // Minimum throttle (1000 µs)
+      motors.sendPWMtoESC(1, 1000);
+      motors.sendPWMtoESC(2, 1000);
+      motors.sendPWMtoESC(3, 1000);
+      motors.sendPWMtoESC(4, 1000);
     }
     else
     {
-      mcpwm_comparator_set_compare_value(motors.comparators[0], motors.m1_command_PWM);
-      mcpwm_comparator_set_compare_value(motors.comparators[1], motors.m2_command_PWM);
-      mcpwm_comparator_set_compare_value(motors.comparators[2], motors.m3_command_PWM);
-      mcpwm_comparator_set_compare_value(motors.comparators[3], motors.m4_command_PWM);
+      motors.sendPWMtoESC(1, motors.m1_command_PWM);
+      motors.sendPWMtoESC(2, motors.m2_command_PWM);
+      motors.sendPWMtoESC(3, motors.m3_command_PWM);
+      motors.sendPWMtoESC(4, motors.m4_command_PWM);
     }
 }
 
@@ -729,30 +633,31 @@ inline void scaleMotorCommandsToPWM()
   motors.m3_command_PWM = configData.throttleLimit * motors.m3_command_scaled * 1000 + 1000;
   motors.m4_command_PWM = configData.throttleLimit * motors.m4_command_scaled * 1000 + 1000;
 }
-/*
+
 inline void calibrateESCs()
 {
     // DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
     // If the Throttle kill switch is in the up position, then skip calibration. To calibrate, turn on the
     // radio and switch the kill switch down and then powerup the drone until it does the beep sequence.  
     // It takes around 8 seconds.
-    return; // only do without props
+    
+    if (!CALIBRATE_ESCS) return; // only do without props - WRITTEN IN BLOOD!
 
     Serial.println("Calibrating ESCs...");
 
     // Full throttle (2000 µs)
-      mcpwm_comparator_set_compare_value(comparators[0], 2000);
-      mcpwm_comparator_set_compare_value(comparators[1], 2000);
-      mcpwm_comparator_set_compare_value(comparators[2], 2000);
-      mcpwm_comparator_set_compare_value(comparators[3], 2000);
+      motors.sendPWMtoESC(1, 2000);
+      motors.sendPWMtoESC(2, 2000);
+      motors.sendPWMtoESC(3, 2000);
+      motors.sendPWMtoESC(4, 2000);
 
     delay(2000);
 
     // Minimum throttle (1000 µs)
-      mcpwm_comparator_set_compare_value(comparators[0], 1000);
-      mcpwm_comparator_set_compare_value(comparators[1], 1000);
-      mcpwm_comparator_set_compare_value(comparators[2], 1000);
-      mcpwm_comparator_set_compare_value(comparators[3], 1000);
+      motors.sendPWMtoESC(1, 1000);
+      motors.sendPWMtoESC(2, 1000);
+      motors.sendPWMtoESC(3, 1000);
+      motors.sendPWMtoESC(4, 1000);
 
     delay(1000);
 
@@ -762,7 +667,6 @@ inline void calibrateESCs()
     while (true) delay(10);
 }
 
-*/
 void throttleCut()
 {
   // DESCRIPTION: Directly set actuator outputs to minimum value if triggered
@@ -776,7 +680,7 @@ void throttleCut()
 
   if (radioData.throttle_is_cut)
   {
-    killMotors(); // make sure we keep those motors at 0 if the throttle was cut.
+    motors.kill(); // make sure we keep those motors at 0 if the throttle was cut.
 
     if (radioData.PWM_ThrottleCutSwitch > 1500)
     { // switch is in the down position which means enable flight
@@ -793,14 +697,14 @@ void throttleCut()
           throttleNotCutCounter = 0;
           throttleCutCounter = 0;
           radioData.throttle_is_cut = false;
-          telemetry.flying = true;
+          telemetry.flying = false;
           if (altitudeData.hasBMP581) xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
           telemetry.lowestThrottlePWM = 2000; // Reset for tracking highest and lowest throttle during flight
           telemetry.highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
           altitudeData.fastestAscent = 0.0f;
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
-          setHome();         // Set home position on throttle uncut.
+          gps.setHome();         // Set home position on throttle uncut.
           imu.MadgwickInit();     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
         }
@@ -816,7 +720,7 @@ void throttleCut()
       radioData.throttle_is_cut = true;
       throttleCutCounter = 0;
       telemetry.flying = false;
-      killMotors();
+      motors.kill();
     }
     return;
   }
@@ -826,7 +730,7 @@ void throttleCut()
   {
     if (imu.roll_IMU > 75 || imu.roll_IMU < -75 || imu.pitch_IMU > 75 || imu.pitch_IMU < -75)
     {
-      killMotors();
+      motors.kill();
       return;
     }
   }
@@ -838,39 +742,13 @@ void throttleCut()
       if (imu.roll_IMU > 15 || imu.roll_IMU < -15 || imu.pitch_IMU > 15 || imu.pitch_IMU < -15)
       {
         // This helps with struggles on take off or it sitting too tilted on the launch pad.
-        killMotors();
+        motors.kill();
         return;
       }
     }
   }
   throttleNotCutCounter = 0;
   throttleCutCounter = 0;
-}
-
-void setHome()
-{
-  if (gps.hasGPS && gps.fixType >= 3)
-  {
-      gps.homePosLatitude = gps.latitude;
-      gps.homePosLongitude = gps.longitude;
-      gps.homeValid = true;
-  } else {
-      gps.homeValid = false;
-  }
-}
-
-void killMotors()
-{
-  // sets the PWM to its lowest value to shut off a motor such as when the throttle cut switch is flipped or it gets too steep of an angle.
-  radioData.throttle_is_cut = true;
-  motors.m1_command_PWM = 1000;      // This is milliseconds for PWM.  1000 is off. 2000 is full throttle.
-  motors.m1_command_scaled_prev = 0; // This is 0 to 1.
-  motors.m2_command_PWM = 1000;
-  motors.m2_command_scaled_prev = 0;
-  motors.m3_command_PWM = 1000;
-  motors.m3_command_scaled_prev = 0;
-  motors.m4_command_PWM = 1000;
-  motors.m4_command_scaled_prev = 0;
 }
 
 void tock()
@@ -926,11 +804,11 @@ void printJSON()
     Serial.print(motors.m4_command_PWM);
 
     Serial.print(F(", \"AccX\": "));
-    Serial.print(AccX);
+    Serial.print(imu.AccX);
     Serial.print(F(", \"AccY\": "));
-    Serial.print(AccY);
+    Serial.print(imu.AccY);
     Serial.print(F(", \"AccZ\": "));
-    Serial.print(AccZ);
+    Serial.print(imu.AccZ);
 
     Serial.print(F(", \"GyroX\": "));
     Serial.print(imu.GyroX);
@@ -938,10 +816,10 @@ void printJSON()
     Serial.print(imu.GyroY);
     Serial.print(F(", \"GyroZ\": "));
     Serial.print(imu.GyroZ);
-    Serial.print(F(", \"RollIMU\": "));
-    Serial.print(imu.roll_IMU);
-    Serial.print(F(", \"PitchIMU\": "));
-    Serial.print(imu.pitch_IMU);
+    Serial.print(F(", \"Flying\": "));
+    Serial.print(telemetry.flying);
+    Serial.print(F(", \"Altitude\": "));
+    Serial.print(altitudeData.altitude);
     Serial.print(F(", \"YawIMU\": "));
     Serial.print(imu.yaw_IMU);
 
@@ -980,7 +858,7 @@ void printJSON()
     Serial.print(debugger);
 
     Serial.print(F(", \"DeltaTime\": "));
-    Serial.print(madDeltaTime * 1000000.0);
+    Serial.print(imu.madDeltaTime * 1000000.0);
     Serial.println("}");
   }
 }
@@ -1203,7 +1081,7 @@ void setValuesFromUserForm(String req)
     else if (key == "failsafeThrottlePWM")
     {
       configData.failsafeThrottlePWM = value.toInt();
-      altitudeData.sessionHoverPWM = configData.failsafeThrottlePWM ; 
+      altitudeData.sessionHoverPWM = configData.failsafeThrottlePWM; 
     }
     else if (key == "kp_altitude_rate") altitudeData.kp_altitude_rate = value.toFloat();
     else if (key == "ki_altitude_rate") altitudeData.ki_altitude_rate = value.toFloat();
@@ -1380,10 +1258,10 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<table>";
   body += "<tr><td>Desired Roll=" + String(pid.roll_des) + "&#176;</td><td>IMU Roll=" + String(imu.roll_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Desired Pitch=" + String(pid.pitch_des) + "&#176;</td><td>IMU Pitch=" + String(imu.pitch_IMU) + "&#176;</td></tr>";
-  body += "<tr><td>Loop Time=" + String(int(round((madDeltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(radioData.PWM_throttle) + "</td></tr>";
+  body += "<tr><td>Loop Time=" + String(int(round((imu.madDeltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(radioData.PWM_throttle) + "</td></tr>";
   body += "<tr><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
-  body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(highestThrottlePWM) + "</td></tr>";
-  body += "<tr><td>Lowest Throttle=" + String(lowestThrottlePWM) + "</td><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td></tr>";
+  body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(telemetry.highestThrottlePWM) + "</td></tr>";
+  body += "<tr><td>Lowest Throttle=" + String(telemetry.lowestThrottlePWM) + "</td><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td></tr>";
   body += "<tr><td>Longitude = " + String(gps.longitude,2) + "&#176;</td><td>Latitude = " + String(gps.latitude, 2) + "&#176;</td></tr>";
   body += "<tr><td>GPS Fix=" + String(gps.fixType) +"</td><td>Altitude=" + String(altitudeData.altitude) + " ft</td></tr>";
   body += "<tr><td>PWM Yaw=" + String(radioData.PWM_yaw) +"</td><td>PWM Row=" + String(radioData.PWM_roll) + " ft</td></tr>";

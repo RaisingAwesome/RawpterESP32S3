@@ -4,17 +4,29 @@
 
 #include "RmtPPMReader.h"                    // Raising Awesome's PPM pulse capture code
 #include "Constants.h"                       // Project constants
-#include "Types.h"                           // General Structs
+#include "RawpterIMU.h"
+#include "Types.h"
+#include "RawpterTelemetry.h"
 
 struct RadioData
 {
   // Radio communication:
-  int16_t PWM_throttle, PWM_roll, PWM_pitch, PWM_yaw, PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
+  RmtPPMReader radio;
+
+  int16_t PWM_throttle=PWM_throttle_zero;
+  int16_t PWM_roll=PWM_roll_fs;
+  int16_t PWM_pitch=PWM_pitch_fs;
+  int16_t PWM_yaw=PWM_yaw_fs;
+  int16_t PWM_ThrottleCutSwitch, PWM_FailsafeSwitch;
   int16_t PWM_throttle_prev, PWM_roll_prev, PWM_pitch_prev, PWM_yaw_prev;
   bool failsafed = false;
   bool throttle_is_cut = true; // used to force the pilot to manually set the throttle to zero after the switch is used to throttle cut
-  RmtPPMReader radio;
-
+    
+  void begin(uint8_t pin, uint32_t rmtFreqHz, uint16_t pulses, uint16_t pulseDurationThreshold)
+  {
+    radio.begin(pin,rmtFreqHz,pulses,pulseDurationThreshold);
+  }
+  
   int16_t getRadioPWM(int ch_num, int16_t defaultVal)
   {
     // DESCRIPTION: Get current radio commands from interrupt routine
@@ -69,13 +81,119 @@ struct RadioData
     return value;
   }
 
-  inline void getRadioStickValues(AltitudeData &altitudeData, bool flying)
+  inline void setToFailsafe()
+  {
+    // This would only be called if the receiver itself had a major problem or is not set to failsafe
+    // in it's failsafe settings. If it loses
+    // connection, it gives its own failsafe value. To signal a failsafe state, the
+    // receiver must be setup to failsafe switchB to 2000 to flag the break of connection.
+    // With that, this would not be called. It only gets called if there is no valid value at all.
+    // That's bad news and so this routine basically drops it from the sky as it would be in a hopeless state.
+    PWM_throttle = PWM_throttle_fs;
+    PWM_roll = PWM_roll_fs;
+    PWM_pitch = PWM_pitch_fs;
+    PWM_yaw = PWM_yaw_fs;
+    PWM_ThrottleCutSwitch = PWM_ThrottleCutSwitch_fs;
+    PWM_FailsafeSwitch = PWM_FailsafeSwitch_fs;
+  }
+
+void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset) {
+    static float prev_errN = 0.0f;
+    static float prev_errE = 0.0f;
+    static unsigned long last_gps_time = 0;
+    static float K_accel2pwm = 10.0f;
+    static float K_d = 1.0f;
+    static float K_p = 10.0f;
+
+    // Use a local flag to handle the very first frame of GPS data
+    static bool first_run = true;
+
+    if (reset) {
+        last_gps_time = millis();
+        first_run = true; // Signal that we need to prime the error values
+        return; 
+    }
+
+    if (gps.useGPS) {
+        float errN, errE;
+        gpsErrorToNE(gps.latitude, gps.longitude, gps.homePosLatitude, gps.homePosLongitude, errN, errE);
+
+        // PRIMING: On the first loop after a reset, just store the values and exit
+        if (first_run) {
+            prev_errN = errN;
+            prev_errE = errE;
+            last_gps_time = millis();
+            first_run = false;
+            return; 
+        }
+
+        unsigned long now = millis();
+        float dt = (now - last_gps_time) / 1000.0f;
+        float dist2 = errN * errN + errE * errE;
+
+        // Standard PD Logic
+        if (dist2 > 1.0f && dt > 0.0f) {
+            float velN = (errN - prev_errN) / dt;
+            float velE = (errE - prev_errE) / dt;
+
+            float targetAccelN = (K_p * errN) + (K_d * velN);
+            float targetAccelE = (K_p * errE) + (K_d * velE);
+
+            // 3. Coordinate Rotation
+            float psi = -imu.yaw_IMU * 0.01745329252f;
+            float c = cosf(psi);
+            float s = sinf(psi);
+
+            float accelForward =  c * targetAccelN + s * targetAccelE;
+            float accelRight   = -s * targetAccelN + c * targetAccelE;
+
+            // 4. Update PWM outputs
+            PWM_pitch = 1500.0f - (accelForward * K_accel2pwm);
+            PWM_pitch = constrain(PWM_pitch, 1350, 1650);
+            PWM_roll = 1500.0f + (accelRight   * K_accel2pwm);
+            PWM_roll  = constrain(PWM_roll, 1350, 1650);
+            
+            gps.atHome = false;
+        } else if (dist2 <= 1.0f) {
+            // Arrived: Level the drone
+            PWM_pitch = 1500;
+            PWM_roll  = 1500;
+            gps.atHome = true;
+        }
+
+        // Store current values for the next loop's D-term calculation
+        prev_errN = errN;
+        prev_errE = errE;
+        last_gps_time = now;
+
+    } else {
+        // GPS lost failsafe: Level out immediately
+        PWM_pitch = 1500;
+        PWM_roll  = 1500;
+    }
+}
+
+  void gpsErrorToNE(double lat_now, double lon_now,
+                          double lat_home, double lon_home,
+                          float &errN_m, float &errE_m)
+  {
+      const double deg2rad = 0.017453292519943295;
+      double dLat = (lat_home - lat_now) * deg2rad;
+      double dLon = (lon_home - lon_now) * deg2rad;
+      double latRad = lat_now * deg2rad;
+
+      double R = 6378137.0; // Earth radius
+      errN_m = (float)(R * dLat);
+      errE_m = (float)(R * cos(latRad) * dLon);
+  }
+
+  inline void getRadioStickValues(AltitudeData& altitudeData, GPSData& gps, RawpterTelemetry& telemetry, ConfigData& configData, RawpterIMU& imu)
   {
     static int throttleOverrideCounter = 0;
     static bool landing = false;
     static float integralAltitudeRate = 0 ;
     static unsigned long landingTicks = 0;
-
+    static bool resetGPS = false;
     // Read radio PWM
     PWM_throttle = getRadioPWM(throttlePin, 1000);
     PWM_roll = getRadioPWM(rollPin, 1500);
@@ -89,7 +207,7 @@ struct RadioData
     
     if (altitudeData.hasBMP581) 
     {
-      if (PWM_FailsafeSwitch < 1900 /*landing*/ && flying)
+      if (PWM_FailsafeSwitch < 1900 /*landing*/ && telemetry.flying)
       {   
           if (!landing)
           {
@@ -97,20 +215,21 @@ struct RadioData
             integralAltitudeRate = 0.0f; // reset integrator on landing start
             throttleOverrideCounter = 0;
             landing = true;
+            resetGPS = true;
             gps.atHome = false; // reset atHome flag to false to ensure heading home.
           }
           
 
           if (landingTicks++ > 5000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
           {
-            killMotors(); // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
+            throttle_is_cut; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
             landing=false;
             return;
           }
           else
           {
-              headHome(); // this will override pitch and roll PWM to head home if a GPS exists.
-              
+              headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
+              resetGPS = false;
               if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
               {
                   throttleOverrideCounter = 0;
