@@ -687,7 +687,7 @@ void throttleCut()
       // reset (uncut throttle) only if throttle is down to prevent a jolting suprise
       if (radioData.PWM_throttle < 1520 && ++throttleNotCutCounter > 10)
       { // The radio is ready for flight and confirmed not to be just a blip.
-        if (radioData.PWM_FailsafeSwitch < 1900)
+        if (radioData.PWM_FailsafeSwitch < 1900 /*landing*/)
         {
           playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
           throttleNotCutCounter = 0;
