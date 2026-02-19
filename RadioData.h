@@ -101,13 +101,13 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
     static float prev_errN = 0.0f;
     static float prev_errE = 0.0f;
     static unsigned long last_gps_time = 0;
-    static float K_accel2pwm = 10.0f;
+    static float K_accel2pwm = 5.0f;
     static float K_d = 1.0f;
-    static float K_p = 10.0f;
+    static float K_p = 5.0f;
 
     // Use a local flag to handle the very first frame of GPS data
     static bool first_run = true;
-
+    
     if (reset) {
         last_gps_time = millis();
         first_run = true; // Signal that we need to prime the error values
@@ -132,7 +132,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
         float dist2 = errN * errN + errE * errE;
 
         // Standard PD Logic
-        if (dist2 > 1.0f && dt > 0.0f) {
+        if (dist2 > 3.0f && dt > 0.0f) {
             float velN = (errN - prev_errN) / dt;
             float velE = (errE - prev_errE) / dt;
 
@@ -154,7 +154,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
             PWM_roll  = constrain(PWM_roll, 1350, 1650);
             
             gps.atHome = false;
-        } else if (dist2 <= 1.0f) {
+        } else if (dist2 <= 3.0f) {
             // Arrived: Level the drone
             PWM_pitch = 1500;
             PWM_roll  = 1500;
@@ -170,6 +170,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
         // GPS lost failsafe: Level out immediately
         PWM_pitch = 1500;
         PWM_roll  = 1500;
+        gps.atHome = true; // Consider ourselves "home" if we have no GPS, so that we don't try to head to a non-existent home location.
     }
 }
 
@@ -222,8 +223,9 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
 
           if (landingTicks++ > 5000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
           {
-            throttle_is_cut; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
-            landing=false;
+            throttle_is_cut = true; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
+            landing = false;
+            PWM_Throttle = 1500; 
             return;
           }
           else
@@ -239,6 +241,10 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                       landingRate = 0.0f;
                   }
                   float rateError  = landingRate - altitudeData.rateFPS;
+                  
+                  // Integrator
+                  integralAltitudeRate += rateError * 0.01f;  // 100 Hz is ticks at .01 seconds
+                  
                   if (rateError > 0.5f && integralAltitudeRate < 0.0f)
                   {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
@@ -247,8 +253,6 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                   {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }
-                  // Integrator
-                  integralAltitudeRate += rateError * 0.01f;  // 100 Hz is ticks at .01 seconds
 
                   // Don't accululate beyond PWM limits so you don't over saturate the integral.
                   float lowend  = -(altitudeData.sessionHoverPWM-1500) / altitudeData.ki_altitude_rate;
