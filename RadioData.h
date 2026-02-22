@@ -225,12 +225,12 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
           {
             throttle_is_cut = true; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
             landing = false;
-            PWM_Throttle = 1500; 
+            PWM_throttle = 1500; 
             return;
           }
           else
           {
-              headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
+              //headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
               resetGPS = false;
               if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
               {
@@ -238,18 +238,18 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                   float landingRate = altitudeData.targetRateLanding;
                   if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
                   {
-                      landingRate = 0.0f;
+                      //landingRate = 0.0f; disabling until we get a Magnetometer for yaw.
                   }
-                  float rateError  = landingRate - altitudeData.rateFPS;
+                  float rateError  = landingRate - altitudeData.rateFPS; // Going up example:  -.1 - 1 = -1.1 (error is negative), Going down example:  -.1 - (-1) = .9
                   
                   // Integrator
-                  integralAltitudeRate += rateError * 0.01f;  // 100 Hz is ticks at .01 seconds
+                  integralAltitudeRate += rateError * 0.01f; // 100 Hz is ticks at .01 seconds
                   
                   if (rateError > 0.5f && integralAltitudeRate < 0.0f)
                   {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }
-                  else if (rateError < 1.0f && integralAltitudeRate > 0.0f)
+                  else if (rateError < -0.5f && integralAltitudeRate > 0.0f)
                   {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }

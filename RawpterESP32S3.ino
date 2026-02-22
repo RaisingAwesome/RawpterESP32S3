@@ -225,7 +225,7 @@ void setAltitude()
     ratio = fmaxf(ratio, 0.000001f);
     // Compute relative altitude in feet
     float newAltitude = (1.0f - expf(exponent * logf(ratio))) * scaleFeet;
-    altitudeData.altitudeWorking += 0.40f * (newAltitude - altitudeData.altitudeWorking);  //1.0 would make newAltitude be the current value, .1 would make the prior value hold the most weight
+    altitudeData.altitudeWorking += 0.20f * (newAltitude - altitudeData.altitudeWorking);  //1.0 would make newAltitude be the current value, .1 would make the prior value hold the most weight
   }
   else
   {

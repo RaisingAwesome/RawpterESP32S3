@@ -1,6 +1,6 @@
 #pragma once
 #include <SPI.h>                             // SPI Communication Support for IMU
-
+// Yaw and magnetometer chat: https://gemini.google.com/share/d0c10d7e359e
 struct RawpterIMU
 {
   // Madgwick Parameters (the method that calculates angles fromt he IMU)
@@ -27,23 +27,23 @@ struct RawpterIMU
   float roll_IMU_prev, pitch_IMU_prev;
 
   // GPS Flight Controller
-  /*
+  
   float AccErrorX = -0.01;
   float AccErrorY = -0.01;
   float AccErrorZ = 0.00;
   float GyroErrorX = 0.54;
   float GyroErrorY = -0.73;
   float GyroErrorZ = 0.36;
-  */
+  
   // No-GPS Flight Controller - big boy
-
+/*
   float AccErrorX = 0.03;
   float AccErrorY = 0.01;
   float AccErrorZ = -0.01;
   float GyroErrorX = -1.21;
   float GyroErrorY = 0.42;
   float GyroErrorZ = 0.77;
-  
+  */
   
   void getIMUdata(ConfigData &configData)
   {
