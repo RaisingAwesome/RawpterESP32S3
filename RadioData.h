@@ -249,7 +249,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                   {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }
-                  else if (rateError < -0.5f && integralAltitudeRate > 0.0f)
+                  else if (rateError < -1.0f && integralAltitudeRate > 0.0f)
                   {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }

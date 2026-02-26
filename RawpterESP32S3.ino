@@ -515,8 +515,8 @@ void PIDControlCalcs()
 
   if (configData.rateControlMode)
   {
-    pid.desiredRateRoll = (pid.roll_des-configData.trimRoll)/configData.maxRoll * rollLimits.maxRate;    // Between -500 and 500 deg/sec
-    pid.desiredRatePitch =  (pid.pitch_des-configData.trimPitch)/configData.maxPitch * pitchLimits.maxRate; // Between -500 and 500 deg/sec
+    pid.desiredRateRoll = (pid.roll_des/configData.maxRoll) * rollLimits.maxRate;    // Between -500 and 500 deg/sec
+    pid.desiredRatePitch =  (pid.pitch_des/configData.maxPitch) * pitchLimits.maxRate; // Between -500 and 500 deg/sec
     pid.desiredRateRoll = constrain(pid.desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
     pid.desiredRatePitch = constrain(pid.desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
   }
@@ -726,7 +726,7 @@ void throttleCut()
   }
 
   // This attemps to save propellers by not driving motors when it goes full sideways. It is also helpful if it accidently runs in a house to keep it from becoming the Tazmanian devil.
-  if (radioData.PWM_throttle<1600&&!BENCH_TESTING)
+  if (radioData.PWM_throttle<1600&&!BENCH_TESTING&&!configData.rateControlMode)
   {
     if (imu.roll_IMU > 75 || imu.roll_IMU < -75 || imu.pitch_IMU > 75 || imu.pitch_IMU < -75)
     {
@@ -1139,7 +1139,7 @@ void saveParameters()
   prefs.putFloat("kpaltrate", altitudeData.kp_altitude_rate);
   prefs.putFloat("kialtrate", altitudeData.ki_altitude_rate);
   prefs.putFloat("upGain" , altitudeData.upGain);
-  prefs.putFloat("targetRateLanding", altitudeData.targetRateLanding);
+  prefs.putFloat("targetRateLand", altitudeData.targetRateLanding);
   prefs.putFloat("trimPitch", configData.trimPitch);
   prefs.putFloat("trimRoll", configData.trimRoll);
   prefs.putFloat("trimYaw", configData.trimYaw);
@@ -1181,7 +1181,7 @@ void loadParameters()
   configData.failsafeThrottlePWM = prefs.getInt("fsThrottlePWM", configData.failsafeThrottlePWM);
   altitudeData.kp_altitude_rate = prefs.getFloat("kpaltrate", altitudeData.kp_altitude_rate);
   altitudeData.ki_altitude_rate = prefs.getFloat("kialtrate", altitudeData.ki_altitude_rate);
-  altitudeData.targetRateLanding = prefs.getFloat("targetRateLanding", altitudeData.targetRateLanding);
+  altitudeData.targetRateLanding = prefs.getFloat("targetRateLand", altitudeData.targetRateLanding);
   altitudeData.upGain = prefs.getFloat("upGain", altitudeData.upGain);
   altitudeData.ceiling = prefs.getFloat("ceiling", altitudeData.ceiling);
   configData.trimPitch = prefs.getFloat("trimPitch", configData.trimPitch);
