@@ -5,9 +5,10 @@
 
 #include "Project.h"
 
-constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
+constexpr bool BENCH_TESTING = true; // Used for bench testing safely with USB power only
 constexpr bool CALIBRATE_ESCS = false; // used for bench calibration - be careful!!!!
 constexpr bool CALCULATE_IMU_ERROR = false; // used to generate the error parameters
+constexpr bool CALIBRATE_MAGNETOMETER =false; // used to get the mag offsets for hard and soft iron
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
 AltitudeData altitudeData{};
@@ -22,12 +23,13 @@ RawpterMotors motors(radioData);
 PID pid{};
 RawpterTelemetry telemetry{};
 RawpterIMU imu{};
+IST8310 magnetometer{};
 
 // General stuff for controlling timing of things
 unsigned long innerLoopMicroseconds = 1000000.0 / INNER_LOOP_FREQUENCY; // The microsecond equivalent of our Loop Hz.
 bool resetTimers = false;
 unsigned long tick_time, prev_time;
-unsigned long print_counter;
+
 volatile unsigned long debugger;
 bool playingSong = false;
 TaskHandle_t loopDroneHandle = NULL; // Handle for the main drone control loop task that will run on its own core.
@@ -48,9 +50,11 @@ void setup()
   setupPeripherals();        // Sets up I2C, ADC resolution, and any other peripherals needed
   setupBatteryMonitor();     // Sets up the ADC to monitor battery voltage
   WiFiBegin();               // Sets up the WiFi access point and web server
-  gps.begin();                // Checks for a Max10S GPS module and initializes it if found enabling return to home
+  gps.begin();               // Checks for a Max10S GPS module and initializes it if found enabling return to home
   altitudeData.begin(configData.failsafeThrottlePWM);     // Gets some default info and ensures their is a working BMP581 on board
-  imu.begin();                // Ensures there is a working IMU on board - it's imperative.
+  magnetometer.begin();      // Initialize the IST8310.
+  if (CALIBRATE_MAGNETOMETER) magnetometer.calibrate();
+  imu.begin(magnetometer);   // Ensures there is a working IMU on board - it's imperative.
   if (CALCULATE_IMU_ERROR) imu.calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   
   if (!BENCH_TESTING)
@@ -68,7 +72,7 @@ void loop()
   tick();                                   // Starts the loop pacing
   syncSensors();                            // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
   radioData.getRadioStickValues(altitudeData, gps, telemetry, configData, imu); // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
-  imu.getIMUdata(configData);              // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  imu.getIMUdata(configData, magnetometer);              // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
@@ -89,9 +93,8 @@ inline void tick()
 void setupPeripherals()
 {
   analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
-  Wire.begin(8, 9); // I2C communication on pin 8 and 9
+  Wire.begin(18, 8,400000); // I2C communication on pin 8 and 9
   delay(100);
-  Wire.setClock(400000); // 400KhZ I2C
 }
 
 inline void syncSensors()
@@ -112,8 +115,8 @@ void beginAltitudeTask()
   // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
   // on its own core.
   xTaskCreatePinnedToCore(
-      bmpAndgpsTask,               // Task function
-      "BMP and GPS Task",          // Name
+      sensorTasks,               // Task function
+      "Sensor Tasks",          // Name
       4096,                        // Stack size (bytes)
       NULL,                        // Parameters
       1,                           // Priority (Highest priority on core)
@@ -122,7 +125,7 @@ void beginAltitudeTask()
   );
 }
 
-void bmpAndgpsTask(void *pvParameters)
+void sensorTasks(void *pvParameters)
 {
   TickType_t lastWakeTime = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(10); // 100 Hz
@@ -142,6 +145,7 @@ void bmpAndgpsTask(void *pvParameters)
         gps.fixType = gps.Max10SGPS.getFixType();
         if (gps.homeValid && gps.fixType >= 3) gps.useGPS = true;
         else gps.useGPS = false; 
+        if (!magnetometer.hasData && magnetometer.update()) magnetometer.hasData = true ; // This flag will get switch when consumed by getIMUData in the IMU struct.
       }
     }
     // Delay until the next absolute 10 ms boundary
@@ -341,7 +345,7 @@ void waitForRadio()
     radioData.PWM_ThrottleCutSwitch = radioData.getRadioPWM(throttleCutSwitchPin, 2000); // keep it stuck in the loop if it failsafes
     radioData.PWM_FailsafeSwitch = radioData.getRadioPWM(failsafePin, 1000);
     tick();
-    imu.getIMUdata(configData);
+    imu.getIMUdata(configData, magnetometer);
     loopWiFi();
     tock(); // This will warm up the Madgwick while we wait for them to turn on the radio.
     vTaskDelay(1);
@@ -685,15 +689,18 @@ void throttleCut()
     if (radioData.PWM_ThrottleCutSwitch > 1500)
     { // switch is in the down position which means enable flight
       // reset (uncut throttle) only if throttle is down to prevent a jolting suprise
+      
       if (radioData.PWM_throttle < 1520 && ++throttleNotCutCounter > 10)
       { // The radio is ready for flight and confirmed not to be just a blip.
+        
         if (radioData.PWM_FailsafeSwitch < 1900 /*landing*/)
         {
-          playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
+          if (!BENCH_TESTING) playNope(); // Don't want to accidently start in "land mode", so give the pilot a toot.
           throttleNotCutCounter = 0;
         }
         else
         { // Uncut throttle and prepare for flight
+          
           throttleNotCutCounter = 0;
           throttleCutCounter = 0;
           radioData.throttle_is_cut = false;
@@ -705,7 +712,7 @@ void throttleCut()
           altitudeData.fastestAscent = 0.0f;
           playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
           gps.setHome();         // Set home position on throttle uncut.
-          imu.MadgwickInit();     // Reset the quarterion based on sitting still.
+          imu.MadgwickInit(magnetometer);     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
         }
       }
@@ -771,16 +778,19 @@ void tock()
     }
     taskYIELD();
   };
-
+  
   if (resetTimers)
     resetAllTiming(); // Resets the counters that keep the beat for outer loops
 }
 
 void printJSON()
 {
+  static unsigned long print_counter = 0;
+  
   if (tick_time - print_counter > 10000)
   { // Don't go too fast or it slows down the main loop. this is a third of a second.
     print_counter = micros();
+
     Serial.print(F("{\"roll\": "));
     Serial.print(imu.roll_IMU);
     Serial.print(F(", \"pitch\": "));
@@ -802,6 +812,13 @@ void printJSON()
     Serial.print(motors.m3_command_PWM);
     Serial.print(F(", \"m4\": "));
     Serial.print(motors.m4_command_PWM);
+
+    Serial.print(F(", \"MagX\": "));
+    Serial.print(magnetometer.x);
+    Serial.print(F(", \"MagY\": "));
+    Serial.print(magnetometer.y);
+    Serial.print(F(", \"MagZ\": "));
+    Serial.print(magnetometer.z);
 
     Serial.print(F(", \"AccX\": "));
     Serial.print(imu.AccX);
@@ -885,7 +902,7 @@ void WiFiBegin()
   WiFi.setSleep(false);
   vTaskDelay(500);
   server.begin();
-  Serial.println("Web server started on port 80.");
+  //Serial.println("Web server started on port 80.");
   vTaskDelay(100);
 }
 
@@ -977,9 +994,7 @@ void loopWiFi()
   // --- Default page (redirect everything else) ---
   else
   {
-    if (BENCH_TESTING) Serial.println("Generating the page...");
     GenerateDefaultPage(client);
-    if (BENCH_TESTING) Serial.println("Served the page.");
   }
 
   client.stop();
@@ -992,10 +1007,6 @@ void setValuesFromUserForm(String req)
 
   int qIndex = req.indexOf('?');
   int hIndex = req.indexOf("HTTP");
-  if (BENCH_TESTING) Serial.print("qIndex: ");
-  if (BENCH_TESTING) Serial.println(String(qIndex));
-  if (BENCH_TESTING) Serial.print(" hIndex: ");
-  if (BENCH_TESTING) Serial.println(String(hIndex));
   if (qIndex == -1 || hIndex == -1)
     return;
 
@@ -1170,7 +1181,6 @@ void saveParameters()
   prefs.putFloat("Ki_yaw_rate", configData.Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", configData.Kd_yaw_rate);
   prefs.end(); // close namespace
-  if (BENCH_TESTING) Serial.println("Free entries: " + String(prefs.freeEntries()));
 }
 
 void loadParameters()
@@ -1224,12 +1234,10 @@ void loadParameters()
   configData.Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", configData.Kd_yaw_rate);
 
   prefs.end();
-  if (BENCH_TESTING) Serial.println("Parameters loaded from NVS (or defaults if none stored).");
 }
 
 void GenerateDefaultPage(WiFiClient &client) 
 { 
-  if (BENCH_TESTING) Serial.println("About to MakeWebPage.");
   // Build HTML body first (so we can compute Content-Length)
   String body; 
   body.reserve(8192); 
@@ -1252,7 +1260,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "</style></head><body><div id='myHider'>"; 
   body += "<form method=get><div class='container'>";
   // Header and snapshot
-  body += "<h1 class='alert alert-success mb-0 pt-0'>Rawpter V8"; 
+  body += "<h1 class='alert alert-success mb-0 pt-0'>Rawpter V9"; 
   body += "<span style='font-size:10px;'> by Raising Awesome <a href='/' style='margin-top:4px; padding:3px 6px; background-color:#0d6efd; color:#fff; border:1px solid #0d6efd; border-radius:2px; width:100%; cursor:pointer; font-size:10px;'>refresh</a></span></h1><hr>";
   body += "<b>Snapshot:</b><br>";
   body += "<table>";
@@ -1363,5 +1371,4 @@ void GenerateDefaultPage(WiFiClient &client)
   // Send headers + body in one go 
   client.write((const uint8_t *)headers.c_str(), headers.length());
   client.write((const uint8_t *)body.c_str(), body.length());  
-  if (BENCH_TESTING) Serial.println("Made Web Page.");
 }

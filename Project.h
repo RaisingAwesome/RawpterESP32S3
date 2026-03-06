@@ -22,3 +22,4 @@
 #include "RawpterMotors.h"
 #include "RawpterTelemetry.h"
 #include "RawpterIMU.h"
+#include "IST8310.h"                         // The Magnetometer to give us yaw (heading).

@@ -1,12 +1,15 @@
 #pragma once
 #include <SPI.h>                             // SPI Communication Support for IMU
+#include "IST8310.h"
+#include "Constants.h"
 // Yaw and magnetometer chat: https://gemini.google.com/share/d0c10d7e359e
 struct RawpterIMU
 {
   // Madgwick Parameters (the method that calculates angles fromt he IMU)
   SPIClass IMUSPI;   // declare only
   RawpterIMU() : IMUSPI(HSPI) {}   // construct here
-
+  long counter = 0;
+  
   float recipNorm;
   float s0, s1, s2, s3;
   float qDot1, qDot2, qDot3, qDot4;
@@ -15,8 +18,8 @@ struct RawpterIMU
   float q1 = 0.0f;
   float q2 = 0.0f;
   float q3 = 0.0f;
-  unsigned long lastMadgwickUpdateMicros = 0;
-  float madDeltaTime = 1 / IMU_FREQ_HZ;
+  unsigned long lastMadgwickUpdateMicros = micros();
+  float madDeltaTime = 1.0f / ((float)IMU_FREQ_HZ);
 
   // IMU:
   float AccX, AccY, AccZ;
@@ -26,31 +29,22 @@ struct RawpterIMU
   float roll_IMU, pitch_IMU, yaw_IMU;
   float roll_IMU_prev, pitch_IMU_prev;
 
-  // GPS Flight Controller
-  
-  float AccErrorX = -0.01;
-  float AccErrorY = -0.01;
+  // Flight Controller Error
+  float AccErrorX = 0.02;
+  float AccErrorY = -0.00;
   float AccErrorZ = 0.00;
-  float GyroErrorX = 0.54;
-  float GyroErrorY = -0.73;
-  float GyroErrorZ = 0.36;
+  float GyroErrorX = 0.0;
+  float GyroErrorY = 0.00;
+  float GyroErrorZ = 0.12;
   
-  // No-GPS Flight Controller - big boy
-/*
-  float AccErrorX = 0.03;
-  float AccErrorY = 0.01;
-  float AccErrorZ = -0.01;
-  float GyroErrorX = -1.21;
-  float GyroErrorY = 0.42;
-  float GyroErrorZ = 0.77;
-  */
-  
-  void getIMUdata(ConfigData &configData)
+  void getIMUdata(ConfigData &configData, IST8310 &magnetometer)
   {
     // Fast GPIO read (ESP32 example)
     if (gpio_get_level((gpio_num_t)IMU_INT_PIN))
+    {
+      Serial.println("Nope");
       return; // active LOW
-
+    }
     // Burst read: 6 accel + 6 gyro bytes in one transaction
     uint8_t buf[12];
     readBlock(ACCEL_DATA_X1, buf, 12);
@@ -92,27 +86,20 @@ struct RawpterIMU
     unsigned long currentMicros = micros();
     unsigned long tempMicros = (currentMicros - lastMadgwickUpdateMicros);
     //if (tempMicros>=0 && tempMicros<1000) madDeltaTime = tempMicros * USEC_TO_SEC; else madDeltaTime=0.0005f;
-    madDeltaTime = tempMicros * USEC_TO_SEC;
+    madDeltaTime = (float)tempMicros * USEC_TO_SEC;
     lastMadgwickUpdateMicros = currentMicros;
-
-    // Madgwick update
-    // The IMU’s Z‑axis physically points upward, but our control system uses the NED frame where Z points downward. 
-    // NED (North-East-Down) is standard aerospace frame.
-    // X --> forward positive
-    // Y --> right positive
-    // Z --> down positive
-    // The Rawpter is installed like this:
-    // IMU X --> Back of drone
-    // IMU Y --> Left of drone
-    // IMU Z --> Up to the sky
-    // So, to map it to the IMU's physical installation in the frame, for a Z now being roll up when compared to NED,
-    // and X pointing backwards, Y will be positive in the oppositve direction. Based on how the board is installed, 
-    // X is actually pointing to the back of the drone, so its AccX needs flipped. Thus, you call Madgwick like this:
-    Madgwick6DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
+    
+    if (magnetometer.hasData) // This will check for a new update from the mag and updates x, y, and z if true.
+    {
+        Madgwick9DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, magnetometer.x, magnetometer.y, magnetometer.z, madDeltaTime);
+        magnetometer.hasData = false;
+    }
+    else Madgwick6DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
   }
 
-  void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
+ void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
   {
+    
     // Precomputed constants
     constexpr float DEG2RAD = 0.01745329252f; // π/180
     constexpr float RAD2DEG = 57.29577951f;   // 180/π
@@ -186,19 +173,124 @@ struct RawpterIMU
     float twoq0q3 = 2.0f * (q0 * q3);
     float twoq1q2 = 2.0f * (q1 * q2);
 
-    roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-    pitch_IMU = -asin(-2.0f * (q1*q3 - q0*q2))*57.29577951; //degrees
-    yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
+    roll_IMU  = atan2(2.0f * (q0*q1 + q2*q3), 1.0f - 2.0f * (q1*q1 + q2*q2)) * 57.29578f;
+    pitch_IMU = asin(2.0f * (q0*q2 - q3*q1)) * 57.29578f;
+    yaw_IMU   = atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3)) * 57.29578f;
   }
 
-  void MadgwickInit()
-  {
-    // Initialize Madgwick filter with current accelerometer values
-    // Cuts down on thhe time it takes for Madgwick to converge on a stable attitude.
-    while (gpio_get_level((gpio_num_t)IMU_INT_PIN))
-      delay(10); // Wait for it to pull low to indicate data ready
+  void Madgwick9DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float invSampleFreq) {
+  //DESCRIPTION: Attitude estimation through sensor fusion - 9DOF
+  /*
+   * This function fuses the accelerometer gyro, and magnetometer readings AccX, AccY, AccZ, GyroX, GyroY, GyroZ, MagX, MagY, and MagZ for attitude estimation.
+   * Don't worry about the math. There is a tunable parameter B_madgwick in the user specified variable section which basically
+   * adjusts the weight of gyro data in the state estimate. Higher beta leads to noisier estimate, lower 
+   * beta leads to slower to respond estimate. It is currently tuned for 2kHz loop rate. This function updates the roll_IMU,
+   * pitch_IMU, and yaw_IMU variables which are in degrees. If magnetometer data is not available, this function calls Madgwick6DOF() instead.
+   */
+  float recipNorm;
+  float s0, s1, s2, s3;
+  float qDot1, qDot2, qDot3, qDot4;
+  float hx, hy;
+  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
 
-    // Burst read: 6 accel + 6 gyro bytes in one transaction
+  //Convert gyroscope degrees/sec to radians/sec
+  gx *= 0.0174533f;
+  gy *= 0.0174533f;
+  gz *= 0.0174533f;
+
+  //Rate of change of quaternion from gyroscope
+  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+  //Compute feedback only if accelerometer measurement valid (avoids NaN in accelerometer normalisation)
+  if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+
+    //Normalise accelerometer measurement
+    recipNorm = 1/sqrtf(ax * ax + ay * ay + az * az);
+    ax *= recipNorm;
+    ay *= recipNorm;
+    az *= recipNorm;
+
+    //Normalise magnetometer measurement
+    recipNorm = 1/sqrtf(mx * mx + my * my + mz * mz);
+    mx *= recipNorm;
+    my *= recipNorm;
+    mz *= recipNorm;
+
+    //Auxiliary variables to avoid repeated arithmetic
+    _2q0mx = 2.0f * q0 * mx;
+    _2q0my = 2.0f * q0 * my;
+    _2q0mz = 2.0f * q0 * mz;
+    _2q1mx = 2.0f * q1 * mx;
+    _2q0 = 2.0f * q0;
+    _2q1 = 2.0f * q1;
+    _2q2 = 2.0f * q2;
+    _2q3 = 2.0f * q3;
+    _2q0q2 = 2.0f * q0 * q2;
+    _2q2q3 = 2.0f * q2 * q3;
+    q0q0 = q0 * q0;
+    q0q1 = q0 * q1;
+    q0q2 = q0 * q2;
+    q0q3 = q0 * q3;
+    q1q1 = q1 * q1;
+    q1q2 = q1 * q2;
+    q1q3 = q1 * q3;
+    q2q2 = q2 * q2;
+    q2q3 = q2 * q3;
+    q3q3 = q3 * q3;
+
+    //Reference direction of Earth's magnetic field
+    hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
+    hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3;
+    _2bx = sqrtf(hx * hx + hy * hy);
+    _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 + _2q2 * my * q3 - mz * q2q2 + mz * q3q3;
+    _4bx = 2.0f * _2bx;
+    _4bz = 2.0f * _2bz;
+
+    //Gradient decent algorithm corrective step
+    s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) + _2q1 * (2.0f * q0q1 + _2q2q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    recipNorm = 1/sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); // normalise step magnitude
+    s0 *= recipNorm;
+    s1 *= recipNorm;
+    s2 *= recipNorm;
+    s3 *= recipNorm;
+
+    //Apply feedback step
+    qDot1 -= B_madgwick * s0;
+    qDot2 -= B_madgwick * s1;
+    qDot3 -= B_madgwick * s2;
+    qDot4 -= B_madgwick * s3;
+  }
+
+  //Integrate rate of change of quaternion to yield quaternion
+  q0 += qDot1 * invSampleFreq;
+  q1 += qDot2 * invSampleFreq;
+  q2 += qDot3 * invSampleFreq;
+  q3 += qDot4 * invSampleFreq;
+
+  //Normalize quaternion
+  recipNorm = 1/sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q0 *= recipNorm;
+  q1 *= recipNorm;
+  q2 *= recipNorm;
+  q3 *= recipNorm;
+  
+  //compute angles - NWU
+  roll_IMU  = atan2(2.0f * (q0*q1 + q2*q3), 1.0f - 2.0f * (q1*q1 + q2*q2)) * 57.29578f;
+  pitch_IMU = asin(2.0f * (q0*q2 - q3*q1)) * 57.29578f;
+  yaw_IMU   = atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3)) * 57.29578f;
+}
+
+  void MadgwickInit(IST8310 &magnetometer) {
+    // 1. Wait for IMU Data Ready
+    while (gpio_get_level((gpio_num_t)IMU_INT_PIN)) delay(10);
+
+    // 2. Read IMU Data
     uint8_t buf[12];
     readBlock(ACCEL_DATA_X1, buf, 12);
 
@@ -206,29 +298,25 @@ struct RawpterIMU
     int16_t rawAy = (buf[2] << 8) | buf[3];
     int16_t rawAz = (buf[4] << 8) | buf[5];
 
-    int16_t rawGx = (buf[6] << 8) | buf[7];
-    int16_t rawGy = (buf[8] << 8) | buf[9];
-    int16_t rawGz = (buf[10] << 8) | buf[11];
-
-    // Apply offsets + scaling
+    // 3. Apply Offsets/Scaling
     float ax = (rawAx - AccErrorX) * G_PER_LSB;
     float ay = (rawAy - AccErrorY) * G_PER_LSB;
     float az = (rawAz - AccErrorZ) * G_PER_LSB;
 
     float norm = sqrtf(ax * ax + ay * ay + az * az);
+    if (norm == 0.0f) return;
+    ax /= norm; ay /= norm; az /= norm;
 
-    if (norm == 0.0f)
-      return; // invalid accel
-    ax /= norm;
-    ay /= norm;
-    az /= norm;
-
-    // Compute roll and pitch from gravity
+    // 4. Compute Roll and Pitch from gravity
     float roll = atan2f(ay, az);
     float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
-    float yaw = 0.0f; // no magnetometer, assume heading = 0
 
-    // Convert to quaternion
+    // 5. Get Yaw from Magnetometer
+    // This assumes the drone is flat. If not flat, you need tilt compensation.
+    float yaw = magnetometer.getHeadingRadians();
+    Serial.println(String(yaw * 57.29578f));
+    delay(4000);
+    // 6. Convert Euler (Roll, Pitch, Yaw) to Quaternion
     float cy = cosf(yaw * 0.5f);
     float sy = sinf(yaw * 0.5f);
     float cp = cosf(pitch * 0.5f);
@@ -236,25 +324,23 @@ struct RawpterIMU
     float cr = cosf(roll * 0.5f);
     float sr = sinf(roll * 0.5f);
 
+    // Standard Aerospace Rotation Sequence (ZYX)
     q0 = cr * cp * cy + sr * sp * sy;
     q1 = sr * cp * cy - cr * sp * sy;
     q2 = cr * sp * cy + sr * cp * sy;
     q3 = cr * cp * sy - sr * sp * cy;
 
-    // Normalize quaternion
+    // 7. Normalize Quaternion
     norm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    q0 /= norm;
-    q1 /= norm;
-    q2 /= norm;
-    q3 /= norm;
+    q0 /= norm; q1 /= norm; q2 /= norm; q3 /= norm;
 
-    // Cache Euler angles for consistency
-    roll_IMU = roll * 57.29577951f; // RAD2DEG
-    pitch_IMU = -pitch * 57.29577951f; // Flip pitch axis to match NASA
-    yaw_IMU = -yaw * 57.29577951f; // Flip yaw axis to match NASA
+    // 8. Cache for display/telemetry
+    roll_IMU = roll * 57.29578f;
+    pitch_IMU = -pitch * 57.29578f;
+    yaw_IMU = yaw * 57.29578f;
   }
 
-  void begin()
+  void begin(IST8310 &magnetometer)
     {
     // DESCRIPTION: Initialize IMU and set to 2000Hz gyro and 2000Hz accel output rates.
     pinMode(IMU_INT_PIN, INPUT);
@@ -267,7 +353,7 @@ struct RawpterIMU
     delay(200);                          // give time for reset
     uint8_t whoami = readRegister(0x75); // WHO_AM_I register should return 0x3B
     delay(100);
-    Serial.print("WHO_AM_I: 0x");
+    Serial.print("IMU WHO_AM_I Response: 0x");
     Serial.println(whoami, HEX);
     if (whoami == 0x3B)
     {
@@ -301,7 +387,7 @@ struct RawpterIMU
     writeRegister(0x76, 0x0);
     delay(10); // Work with Bank 0
 
-    MadgwickInit(); // Initialize Madgwick filter with current accelerometer values
+    MadgwickInit(magnetometer); // Initialize Madgwick filter with current accelerometer values
     Serial.println("IMU config complete.");
 }
 
