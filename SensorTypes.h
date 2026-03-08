@@ -22,7 +22,7 @@ struct AltitudeData
   float ki_altitude_rate = .0001f;
   volatile float invGroundPressure = 0.0f;        // reciprocal of baseline pressure at startup
   volatile float invGroundPressureWorking = 0.0f; // This one is worked by the pressure task and then synced to invGroundPressure variable in the main loop.
-  TaskHandle_t bmpTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
+  TaskHandle_t sensorTaskHandle= nullptr;                     // Handle for the BMP581 task that will run on its own core.
   bool hasBMP581 = false;
   float sessionHoverPWM =1600;
   float targetRateLanding = -0.1f; // ft/sec

@@ -140,7 +140,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
             float targetAccelE = (K_p * errE) + (K_d * velE);
 
             // 3. Coordinate Rotation
-            float psi = -imu.yaw_IMU * 0.01745329252f;
+            float psi = -imu.yaw_IMU * DEG_TO_RAD; // Negative because we want to rotate the error vector in the opposite direction of the drone's heading to get it into the drone's frame of reference.
             float c = cosf(psi);
             float s = sinf(psi);
 
@@ -178,10 +178,10 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                           double lat_home, double lon_home,
                           float &errN_m, float &errE_m)
   {
-      const double deg2rad = 0.017453292519943295;
-      double dLat = (lat_home - lat_now) * deg2rad;
-      double dLon = (lon_home - lon_now) * deg2rad;
-      double latRad = lat_now * deg2rad;
+      
+      double dLat = (lat_home - lat_now) * DEG_TO_RAD;
+      double dLon = (lon_home - lon_now) * DEG_TO_RAD;
+      double latRad = lat_now * DEG_TO_RAD;
 
       double R = 6378137.0; // Earth radius
       errN_m = (float)(R * dLat);
@@ -221,7 +221,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
           }
           
 
-          if (landingTicks++ > 5000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
+          if (landingTicks++ > 20000 || altitudeData.altitude < 1.5f) // 1000 ticks per second - if we have been landing for more than 5 seconds, kill it.
           {
             throttle_is_cut = true; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
             landing = false;
@@ -230,15 +230,25 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
           }
           else
           {
-              //headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
+              headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
               resetGPS = false;
               if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
               {
                   throttleOverrideCounter = 0;
-                  float landingRate = altitudeData.targetRateLanding;
+                  float landingRate = altitudeData.targetRateLanding; // Default to heading downward.
                   if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
                   {
-                      //landingRate = 0.0f; disabling until we get a Magnetometer for yaw.
+                      if (altitudeData.altitude < 8.0f) // Until we are at home, stay between 8.0 - 11.0 ft
+                      {
+                        landingRate = 0.1f;
+                      }
+                      else
+                      {
+                        if (altitudeData.altitude < 11.0f) // Hold altitude if between 8.0 - 11.0 ft
+                        {
+                          landingRate = 0.0f;
+                        }
+                      }
                   }
                   float rateError  = landingRate - altitudeData.rateFPS; // Going up example:  -.1 - 1 = -1.1 (error is negative), Going down example:  -.1 - (-1) = .9
                   

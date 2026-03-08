@@ -5,10 +5,9 @@
 
 #include "Project.h"
 
-constexpr bool BENCH_TESTING = true; // Used for bench testing safely with USB power only
+constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
 constexpr bool CALIBRATE_ESCS = false; // used for bench calibration - be careful!!!!
 constexpr bool CALCULATE_IMU_ERROR = false; // used to generate the error parameters
-constexpr bool CALIBRATE_MAGNETOMETER =false; // used to get the mag offsets for hard and soft iron
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
 AltitudeData altitudeData{};
@@ -53,10 +52,10 @@ void setup()
   gps.begin();               // Checks for a Max10S GPS module and initializes it if found enabling return to home
   altitudeData.begin(configData.failsafeThrottlePWM);     // Gets some default info and ensures their is a working BMP581 on board
   magnetometer.begin();      // Initialize the IST8310.
-  if (CALIBRATE_MAGNETOMETER) magnetometer.calibrate();
   imu.begin(magnetometer);   // Ensures there is a working IMU on board - it's imperative.
   if (CALCULATE_IMU_ERROR) imu.calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
-  
+  if (altitudeData.hasBMP581) beginSensorsTask(); // The sensor reads are blocking and slows the inner loop.  So, this runs it in a separate task.
+
   if (!BENCH_TESTING)
   {
     playStartSong();
@@ -64,7 +63,8 @@ void setup()
     waitForRadio();
   }
   Serial.println("Ready...");
-  if (altitudeData.hasBMP581) beginAltitudeTask(); // The BMP581 sensor read is blocking and slows the inner loop.  This runs it in a separate task.
+  
+  if (BENCH_TESTING) vTaskDelay(4000);
 }
 
 void loop()
@@ -72,7 +72,7 @@ void loop()
   tick();                                   // Starts the loop pacing
   syncSensors();                            // Altitude capture runs at 100mHZ in its own FreeRTOS task. This gives a safe way to update variables without thread conflict. ~12 microseconds to execute
   radioData.getRadioStickValues(altitudeData, gps, telemetry, configData, imu); // Gets the PWM from the radio receiver and overrides if necessary. Pulses are captured by hardware with a rmtRead call and double buffering. ~38 microseconds
-  imu.getIMUdata(configData, magnetometer);              // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
+  imu.getIMUdata(configData, magnetometer); // Pulls raw gyro a daccelerometer data from IMU at 1kHz. IMU output. Is actually downsampled from 32kHz. 
   getDesiredAnglesAndThrottleScaledToOne(); // Convert PWM commands to normalized values at 2kHz. Adds a low pass filter to dampen remote stick noise and user twitchiness. 
   PIDControlCalcs();                        // The PID functions at 400Hz Hz. Stabilize on angle setpoint from getDesiredAnglesAndThrottle 
   motorPipeline();                          // Commands the motors at at 400Hz. This is the max adjustment rate the Simonk can handle. 
@@ -93,13 +93,14 @@ inline void tick()
 void setupPeripherals()
 {
   analogReadResolution(12);  // 12 bit ADC.  Used for sensing battery level in loopBuzzer().
-  Wire.begin(18, 8,400000); // I2C communication on pin 8 and 9
+  Wire.begin(I2C_SDA, I2C_SCL, 400000); // I2C communication for BMP581, Max10S, and IST8310. SDA, SCL, Frequency
+  Wire.setTimeout(300); // I2C timeout of 300ms. The default is 100ms and that is too short for the BMP581 to respond sometimes, especially if it is cold.
   delay(100);
 }
 
 inline void syncSensors()
-{ // This makes sure the pressure sensing task "bmpTaskHandle", is not writing to our variables so we don't corrupt or data.
-  // the bmpTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
+{ // This makes sure the pressure sensing task "sensorTaskHandle", is not writing to our variables so we don't corrupt or data.
+  // the sensorTask use the variables "...Working". Once it notifies that the calculations are complete, we consume them.
   if (ulTaskNotifyTake(pdTRUE, 0) > 0)
   {
     altitudeData.altitude = altitudeData.altitudeWorking;
@@ -110,7 +111,7 @@ inline void syncSensors()
   }
 }
 
-void beginAltitudeTask()
+void beginSensorsTask()
 {
   // Start the BMP581 task on its own core. It is a slow reader, so we'll keep it out of the way of the other tasks
   // on its own core.
@@ -120,7 +121,7 @@ void beginAltitudeTask()
       4096,                        // Stack size (bytes)
       NULL,                        // Parameters
       1,                           // Priority (Highest priority on core)
-      &altitudeData.bmpTaskHandle, // Task handle
+      &altitudeData.sensorTaskHandle, // Task handle
       0                            // Core 0 since it is slower overall
   );
 }
@@ -145,7 +146,7 @@ void sensorTasks(void *pvParameters)
         gps.fixType = gps.Max10SGPS.getFixType();
         if (gps.homeValid && gps.fixType >= 3) gps.useGPS = true;
         else gps.useGPS = false; 
-        if (!magnetometer.hasData && magnetometer.update()) magnetometer.hasData = true ; // This flag will get switch when consumed by getIMUData in the IMU struct.
+        if (!magnetometer.hasData && magnetometer.update()) magnetometer.hasData = true; // This flag will get switch when consumed by getIMUData in the IMU struct.
       }
     }
     // Delay until the next absolute 10 ms boundary
@@ -370,7 +371,7 @@ void setupBatteryMonitor()
 void playStartSong()
 {
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {Note_E4, Note_FS4, Note_A4, Note_B4, Note_A4, Note_E4, Note_FS4, Note_E4, Note_FS4, Note_E4, Note_FS4, Note_E4, Note_FS4};
+  int melody[] = {NOTE_E, NOTE_Fs, NOTE_A, NOTE_B, NOTE_A, NOTE_E, NOTE_Fs, NOTE_E, NOTE_FS, NOTE_E, NOTE_Fs, NOTE_E, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {200, 200, 200, 580, 690, 200, 400, 200, 400, 200, 400, 200, 1200};
@@ -378,7 +379,7 @@ void playStartSong()
   for (int i = 0; i < 13; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i]);
+    ledcWriteTone(BUZZER_PIN, melody[i], 4);
 
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
@@ -390,7 +391,7 @@ void playStartSong()
 void playReadySong()
 {
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {Note_FS4, Note_FS4, Note_FS4};
+  int melody[] = {NOTE_Fs, NOTE_Fs, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {200, 200, 200};
@@ -398,7 +399,7 @@ void playReadySong()
   for (int i = 0; i < 3; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i] * 3);
+    ledcWriteTone(BUZZER_PIN, melody[i] * 3, 4);
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
     delay(400);
@@ -406,9 +407,10 @@ void playReadySong()
 }
 void playNope()
 {
+  return;
   playingSong = true;
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {Note_FS4, Note_FS4};
+  int melody[] = {NOTE_Fs, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {50, 50};
@@ -416,7 +418,7 @@ void playNope()
   for (int i = 0; i < 2; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i] / 3);
+    ledcWriteTone(BUZZER_PIN, melody[i] / 3, 4);
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
     delay(duration * .8);
@@ -432,6 +434,8 @@ inline void loopBuzzer()
   static unsigned long buzzer_millis = millis();
   unsigned long myTime = millis();
   
+  return;
+
   if (playingSong||BENCH_TESTING) return;
   if (radioData.PWM_FailsafeSwitch < 1500)
     buzzer_spacing = 100;
@@ -442,7 +446,7 @@ inline void loopBuzzer()
   {
     if (myTime - buzzer_millis > (buzzer_spacing))
     {
-      ledcWriteTone(BUZZER_PIN, Note_E4);
+      ledcWriteTone(BUZZER_PIN, NOTE_E, 4);
       beeping = true;
       buzzer_millis = myTime;
     }
@@ -480,7 +484,7 @@ inline void getDesiredAnglesAndThrottleScaledToOne()
   pid.throttle_desired = (radioData.PWM_throttle - 1500.0f) / 500.0f;   // Between  0 and 1 because anything under 1500 will be set to 1500 for now.
   pid.roll_des = (radioData.PWM_roll - 1500.0f + configData.trimRoll) / 500.0f;    // Between -1 and 1
   pid.pitch_des = (radioData.PWM_pitch - 1500.0f + configData.trimPitch) / 500.0f; // Between -1 and 1
-  pid.yaw_des = -(radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
+  pid.yaw_des = (radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
 
   // Constrain within normalized bounds
   pid.throttle_desired = constrain(pid.throttle_desired, 0.0f, 1.0f); // Between 0 and 1
@@ -665,8 +669,6 @@ inline void calibrateESCs()
 
     delay(1000);
 
-    Serial.println("Calibration complete.");
-
     // Stall out to force the user to comment this back out after calibration.
     while (true) delay(10);
 }
@@ -705,12 +707,12 @@ void throttleCut()
           throttleCutCounter = 0;
           radioData.throttle_is_cut = false;
           telemetry.flying = false;
-          if (altitudeData.hasBMP581) xTaskNotifyGive(altitudeData.bmpTaskHandle); // Notify that we want the altitude to reset to current ground level
+          if (altitudeData.hasBMP581) xTaskNotifyGive(altitudeData.sensorTaskHandle); // Notify that we want the altitude to reset to current ground level
           telemetry.lowestThrottlePWM = 2000; // Reset for tracking highest and lowest throttle during flight
           telemetry.highestThrottlePWM = 1500;
           altitudeData.highestAltitude = 0.0f;
           altitudeData.fastestAscent = 0.0f;
-          playReadySong();    // This gives us a delay to loop a few times for the other bmpTask altitude variable updates while readying the pilot as well - a win-win strategy./
+          playReadySong();    // This gives us a delay to loop a few times for the other sensorTask altitude variable updates while readying the pilot as well - a win-win strategy./
           gps.setHome();         // Set home position on throttle uncut.
           imu.MadgwickInit(magnetometer);     // Reset the quarterion based on sitting still.
           resetTimers = true; // This will reset all counters to sync timing on the next tock();
@@ -966,29 +968,39 @@ void loopWiFi()
   // --- Your form submission ---
   else if (req.startsWith("GET /?"))
   {
-    setValuesFromUserForm(req);
+    bool calibrateMagnetometer = setValuesFromUserForm(req);
+    
+    if (calibrateMagnetometer)
+    {
+      showMagCalibrationMessage(client);
+      magnetometer.calibrate();
+      saveParameters();
+      client.stop();
+    }
+    else
+    {
+      const char *body =
+          "<!DOCTYPE html>"
+          "<html><head>"
+          "<meta http-equiv='refresh' content='0.2;url=http://192.168.2.4/'>"
+          "<title>Redirecting</title>"
+          "</head>"
+          "<body>"
+          "<div style='font-size:60pt;'>Settings saved. Refreshing...</div>"
+          "</body></html>";
 
-    const char *body =
-        "<!DOCTYPE html>"
-        "<html><head>"
-        "<meta http-equiv='refresh' content='0.2;url=http://192.168.2.4/'>"
-        "<title>Redirecting</title>"
-        "</head>"
-        "<body>"
-        "<div style='font-size:60pt;'>Settings saved. Refreshing...</div>"
-        "</body></html>";
+      int len = strlen(body);
 
-    int len = strlen(body);
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/html");
+      client.println("Connection: close");
+      client.print("Content-Length: ");
+      client.println(len);
+      client.println();
+      client.print(body);
 
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: text/html");
-    client.println("Connection: close");
-    client.print("Content-Length: ");
-    client.println(len);
-    client.println();
-    client.print(body);
-
-    client.stop();
+      client.stop();
+    }
     return;   // clean end of request
   }
   // --- Default page (redirect everything else) ---
@@ -1001,15 +1013,65 @@ void loopWiFi()
   taskYIELD();
 }
 
-void setValuesFromUserForm(String req)
+void showMagCalibrationMessage(WiFiClient &client)
 {
+  // We use a raw string literal (R"raw(...)raw") to make the HTML/JS much easier to read
+  const char *body = R"raw(
+  <!DOCTYPE html>
+  <html>
+  <head>
+      <title>Calibrating Magnetometer</title>
+      <style>
+          body { font-family: sans-serif; text-align: center; padding: 50px; }
+          .message { font-size: 40pt; margin-bottom: 20px; }
+          .timer { font-size: 80pt; color: #ff4444; font-weight: bold; }
+      </style>
+  </head>
+  <body>
+      <div class="message">
+          Calibrating magnetometer... Grab the drone, stay clear of the props, 
+          move it like you are painting the interior of a sphere to cover every 
+          angle and direction.
+      </div>
+      <div class="timer" id="countdown">30</div>
+
+      <script>
+          var seconds = 60;
+          var display = document.getElementById('countdown');
+          
+          var timer = setInterval(function() {
+              seconds--;
+              display.innerText = seconds;
+              if (seconds <= 0) {
+                  clearInterval(timer);
+                  window.location.href = "/";
+              }
+          }, 1000);
+      </script>
+  </body>
+  </html>)raw";
+
+  int len = strlen(body);
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.print("Content-Length: ");
+  client.println(len);
+  client.println();
+  client.print(body);
+}
+
+bool setValuesFromUserForm(String req)
+{ // return true if they want the magnetometer calibrated.
   // Read the full request line (already done in loopWiFi)
 
   int qIndex = req.indexOf('?');
   int hIndex = req.indexOf("HTTP");
   if (qIndex == -1 || hIndex == -1)
-    return;
-
+    return false;
+  
+  Serial.println(req);
   String query = req.substring(qIndex + 1, hIndex - 1); // everything between ? and " HTTP"
   // Split by '&'
   int start = 0;
@@ -1129,9 +1191,13 @@ void setValuesFromUserForm(String req)
     {
       if (value.indexOf("SAVE TO") != -1) {
           saveParameters();
+      } 
+      else if (value.indexOf("BEGIN MAG") != -1) {
+          return true; // this will trigger the magnetometer calibration routine.
       }
     }
   }
+  return false;
 }
 
 void saveParameters()
@@ -1180,6 +1246,12 @@ void saveParameters()
   prefs.putFloat("Kp_yaw_rate", configData.Kp_yaw_rate);
   prefs.putFloat("Ki_yaw_rate", configData.Ki_yaw_rate);
   prefs.putFloat("Kd_yaw_rate", configData.Kd_yaw_rate);
+  prefs.putFloat("offX", magnetometer.offX);
+  prefs.putFloat("offY", magnetometer.offY);
+  prefs.putFloat("offZ", magnetometer.offZ);
+  prefs.putFloat("scaleX", magnetometer.scaleX);
+  prefs.putFloat("scaleY", magnetometer.scaleY);
+  prefs.putFloat("scaleZ", magnetometer.scaleZ);
   prefs.end(); // close namespace
 }
 
@@ -1232,7 +1304,12 @@ void loadParameters()
   configData.Kp_yaw_rate = prefs.getFloat("Kp_yaw_rate", configData.Kp_yaw_rate);
   configData.Ki_yaw_rate = prefs.getFloat("Ki_yaw_rate", configData.Ki_yaw_rate);
   configData.Kd_yaw_rate = prefs.getFloat("Kd_yaw_rate", configData.Kd_yaw_rate);
-
+  magnetometer.offX = prefs.getFloat("offX", magnetometer.offX);
+  magnetometer.offY = prefs.getFloat("offY", magnetometer.offY);  
+  magnetometer.offZ = prefs.getFloat("offZ", magnetometer.offZ);
+  magnetometer.scaleX = prefs.getFloat("scaleX", magnetometer.scaleX);
+  magnetometer.scaleY = prefs.getFloat("scaleY", magnetometer.scaleY);  
+  magnetometer.scaleZ = prefs.getFloat("scaleZ", magnetometer.scaleZ);
   prefs.end();
 }
 
@@ -1266,14 +1343,17 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<table>";
   body += "<tr><td>Desired Roll=" + String(pid.roll_des) + "&#176;</td><td>IMU Roll=" + String(imu.roll_IMU) + "&#176;</td></tr>";
   body += "<tr><td>Desired Pitch=" + String(pid.pitch_des) + "&#176;</td><td>IMU Pitch=" + String(imu.pitch_IMU) + "&#176;</td></tr>";
-  body += "<tr><td>Loop Time=" + String(int(round((imu.madDeltaTime) / 1000000))) + "</td><td>Throttle PWM=" + String(radioData.PWM_throttle) + "</td></tr>";
-  body += "<tr><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
+  body += "<tr><td>Loop Time=" + String(int(round((imu.madDeltaTime) / 1000000))) + "</td><td>Mag Yaw=" + String(imu.yaw_IMU) + "&#176;</td></tr>";
+  body += "<tr><td>Throttle PWM=" + String(radioData.PWM_throttle) + "</td><td>Fastest Ascent=" + String(altitudeData.fastestAscent) + "</td></tr>";
   body += "<tr><td>Highest Altitude=" + String(altitudeData.highestAltitude) + "</td><td>Highest Throttle=" + String(telemetry.highestThrottlePWM) + "</td></tr>";
   body += "<tr><td>Lowest Throttle=" + String(telemetry.lowestThrottlePWM) + "</td><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td></tr>";
   body += "<tr><td>Longitude = " + String(gps.longitude,2) + "&#176;</td><td>Latitude = " + String(gps.latitude, 2) + "&#176;</td></tr>";
   body += "<tr><td>GPS Fix=" + String(gps.fixType) +"</td><td>Altitude=" + String(altitudeData.altitude) + " ft</td></tr>";
   body += "<tr><td>PWM Yaw=" + String(radioData.PWM_yaw) +"</td><td>PWM Row=" + String(radioData.PWM_roll) + " ft</td></tr>";
-  body += "<tr><td>PWM Pitch=" + String(radioData.PWM_pitch) +"</td></tr>";
+  body += "<tr><td>PWM Pitch=" + String(radioData.PWM_pitch) +"</td><td>Battery=" + String(batteryMonitor.calced_voltage, 1) + "V (" + String(batteryMonitor.batteryVoltage) + ")</td></tr>";
+  body += "<tr><td>offX = " + String(magnetometer.offX) +"</td><td>Mag offY=" + String(magnetometer.offY) + "</td></tr>";
+  body += "<tr><td>offZ = " + String(magnetometer.offZ) +"</td><td>Mag scaleX=" + String(magnetometer.scaleX) + "</td></tr>";
+  body += "<tr><td>scaleY = " + String(magnetometer.scaleY) +"</td><td>Mag scaleZ=" + String(magnetometer.scaleZ) + "</td></tr>";
   body += "</table><hr>";
   body += "<b>PID Constants:</b><br>";
   if (batteryMonitor.calced_voltage < 13) { body += "<br><div class='alert alert-danger'>DANGER: BATTERY CRITICAL!</div><br>"; } else if (batteryMonitor.calced_voltage < 14) { body += "<br><div class='alert alert-warning'>Warning: BATTERY LOW!</div><br>"; }
@@ -1353,6 +1433,11 @@ void GenerateDefaultPage(WiFiClient &client)
         "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
         "type='submit' name='action' value='SAVE TO STORAGE' "
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";
+  body += "<br><br><br><input "
+        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#fff; "
+        "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
+        "type='submit' name='action' value='BEGIN MAG CALIBRATION' "
+        "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').innerHtml='Get Ready to Rotate the Drone...'; document.getElementById('shower').style.display='inline'; return true;\" />";
   
   body += "</div></div>"
     "<div style='display:none' id='shower'>"

@@ -42,7 +42,6 @@ struct RawpterIMU
     // Fast GPIO read (ESP32 example)
     if (gpio_get_level((gpio_num_t)IMU_INT_PIN))
     {
-      Serial.println("Nope");
       return; // active LOW
     }
     // Burst read: 6 accel + 6 gyro bytes in one transaction
@@ -89,14 +88,39 @@ struct RawpterIMU
     madDeltaTime = (float)tempMicros * USEC_TO_SEC;
     lastMadgwickUpdateMicros = currentMicros;
     
+    Madgwick6DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
     if (magnetometer.hasData) // This will check for a new update from the mag and updates x, y, and z if true.
     {
-        Madgwick9DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, magnetometer.x, magnetometer.y, magnetometer.z, madDeltaTime);
         magnetometer.hasData = false;
+        calculateNavHeading(pitch_IMU, roll_IMU, magnetometer.x, magnetometer.y, magnetometer.z);
     }
-    else Madgwick6DOF(configData.B_madgwick, GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, madDeltaTime);
   }
+  
+  void calculateNavHeading(float pitchDegrees, float rollDegrees, float magX, float magY, float magZ) 
+  {    
+      // 1. Convert input degrees to radians for trigonometric functions
+      float pitch = pitchDegrees * DEG_TO_RAD;
+      float roll = rollDegrees * DEG_TO_RAD;
 
+      // 2. Tilt compensate the magnetometer readings
+      float cosP = cos(pitch);
+      float sinP = sin(pitch);
+      float cosR = cos(roll);
+      float sinR = sin(roll);
+
+      // Projects the 3D mag vector onto a virtual horizontal plane
+      float Xh = magX * cosP + magY * sinR * sinP + magZ * cosR * sinP;
+      float Yh = magY * cosR - magZ * sinR;
+
+      // 3. Calculate the heading relative to magnetic North
+      float heading = atan2(-Yh, Xh);
+
+      // 4. Convert result back to degrees and normalize to 0-360
+      float navHeading = heading * RAD_TO_DEG;
+      if (navHeading < 0) navHeading += 360.0;
+      
+      yaw_IMU = navHeading;
+ }
  void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
   {
     
@@ -175,18 +199,12 @@ struct RawpterIMU
 
     roll_IMU  = atan2(2.0f * (q0*q1 + q2*q3), 1.0f - 2.0f * (q1*q1 + q2*q2)) * 57.29578f;
     pitch_IMU = asin(2.0f * (q0*q2 - q3*q1)) * 57.29578f;
-    yaw_IMU   = atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3)) * 57.29578f;
+    //yaw comes from a mag calc.
   }
-
+/*
   void Madgwick9DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float invSampleFreq) {
   //DESCRIPTION: Attitude estimation through sensor fusion - 9DOF
-  /*
-   * This function fuses the accelerometer gyro, and magnetometer readings AccX, AccY, AccZ, GyroX, GyroY, GyroZ, MagX, MagY, and MagZ for attitude estimation.
-   * Don't worry about the math. There is a tunable parameter B_madgwick in the user specified variable section which basically
-   * adjusts the weight of gyro data in the state estimate. Higher beta leads to noisier estimate, lower 
-   * beta leads to slower to respond estimate. It is currently tuned for 2kHz loop rate. This function updates the roll_IMU,
-   * pitch_IMU, and yaw_IMU variables which are in degrees. If magnetometer data is not available, this function calls Madgwick6DOF() instead.
-   */
+  
   float recipNorm;
   float s0, s1, s2, s3;
   float qDot1, qDot2, qDot3, qDot4;
@@ -285,7 +303,7 @@ struct RawpterIMU
   pitch_IMU = asin(2.0f * (q0*q2 - q3*q1)) * 57.29578f;
   yaw_IMU   = atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3)) * 57.29578f;
 }
-
+*/
   void MadgwickInit(IST8310 &magnetometer) {
     // 1. Wait for IMU Data Ready
     while (gpio_get_level((gpio_num_t)IMU_INT_PIN)) delay(10);
@@ -314,8 +332,8 @@ struct RawpterIMU
     // 5. Get Yaw from Magnetometer
     // This assumes the drone is flat. If not flat, you need tilt compensation.
     float yaw = magnetometer.getHeadingRadians();
-    Serial.println(String(yaw * 57.29578f));
-    delay(4000);
+    Serial.println("Default Yaw Assuming flat: " + String(yaw * 57.29578f));
+    
     // 6. Convert Euler (Roll, Pitch, Yaw) to Quaternion
     float cy = cosf(yaw * 0.5f);
     float sy = sinf(yaw * 0.5f);
@@ -337,7 +355,7 @@ struct RawpterIMU
     // 8. Cache for display/telemetry
     roll_IMU = roll * 57.29578f;
     pitch_IMU = -pitch * 57.29578f;
-    yaw_IMU = yaw * 57.29578f;
+    calculateNavHeading(pitch_IMU, roll_IMU, magnetometer.x, magnetometer.y, magnetometer.z); //Sets yaw_IMU which is a misnomer.
   }
 
   void begin(IST8310 &magnetometer)

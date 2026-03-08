@@ -11,11 +11,11 @@ struct IST8310
 { 
   int16_t x=0, y=0, z=0;
   bool hasData = false;
-
+  bool calibrating = false;
   // Calibration parameters
-  float offX = 0, offY = 0, offZ = 0; // Hard Iron (Offsets)
-  float scaleX = 1, scaleY = 1, scaleZ = 1; // Soft Iron (Scaling)
-
+  float offX = -7.5f, offY = -3.0f, offZ = -4.50f; // Hard Iron (Offsets)
+  float scaleX = 0.96f, scaleY = 1.15f, scaleZ = 0.92f; // Soft Iron (Scaling)
+  ;
   void begin()
   {
     pinMode(MAG_DRDY_PIN, INPUT); // Set DRDY as input
@@ -43,21 +43,20 @@ struct IST8310
     delay(1000);
   }
 
-  bool update()
+  bool update(bool withOffsets = true)
   { 
+    if (calibrating&&withOffsets) return false; // Do nothing if calibrating but its being called from the main.
     // Only read if DRDY is HIGH
     if (REG_READ(GPIO_IN_REG) & (1 << MAG_DRDY_PIN)) { //fast way to check if IO5 is high
-      readIST8310(x, y, z);
-      return true;
+      if (readIST8310(x, y, z, withOffsets)) return true; else return false;
     } 
     else
     {
       return false;
     } 
-    // No delay needed here; digitalRead handles the timing
   }
 
-  bool readIST8310(int16_t &x, int16_t &y, int16_t &z) {
+  bool readIST8310(int16_t &x, int16_t &y, int16_t &z, bool withOffsets = true) {    
     Wire.beginTransmission(IST8310_ADDR);
     Wire.write(REG_DATA_X_L);
     if (Wire.endTransmission() != 0) return false;
@@ -75,24 +74,27 @@ struct IST8310
       y = (int16_t)(yh << 8 | yl);
       z = -(int16_t)(zh << 8 | zl); // must be flipped with the minus sign to match the installed orientation
 
-      x = ((float)x - (-7.5)) * 0.96; // (x- offset) * scalex from running CALIBRATE_MAGNETOMETER = true
-      y = ((float)y - (-3.0)) * 1.15;
-      z = ((float)z - (-4.50)) * 0.92;
-
+      if (withOffsets)
+      {
+        x = ((float)x - offX) * scaleX; // (x- offset) * scalex from running CALIBRATE_MAGNETOMETER = true
+        y = ((float)y - offY) * scaleY;
+        z = ((float)z - offZ) * scaleZ;
+      }
       return true;
     }
     return false;
   }
-  void calibrate(uint32_t duration_ms = 45000) {
+
+  void calibrate(uint32_t duration_ms = 55000) {
+    // Calibration is triggered with the WebUI
     int16_t minX = 32767, maxX = -32768;
     int16_t minY = 32767, maxY = -32768;
     int16_t minZ = 32767, maxZ = -32768;
-
-    Serial.println("Starting Mag Calibration. Rotate device in all directions (Paint a Sphere's Inside with the nose)!");
+    calibrating = true;
     uint32_t startTime = millis();
 
     while (millis() - startTime < duration_ms) {
-      if (update()) {
+      if (update(false/*withOffsets*/)) {
         if (x < minX) minX = x; if (x > maxX) maxX = x;
         if (y < minY) minY = y; if (y > maxY) maxY = y;
         if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
@@ -114,17 +116,9 @@ struct IST8310
     scaleX = avgDelta / avgDeltaX;
     scaleY = avgDelta / avgDeltaY;
     scaleZ = avgDelta / avgDeltaZ;
-
-    Serial.println("Calibration Complete.");
-    Serial.printf("Offsets: X:%.2f Y:%.2f Z:%.2f\n", offX, offY, offZ);
-    Serial.printf("Scales:  X:%.2f Y:%.2f Z:%.2f\n", scaleX, scaleY, scaleZ);
-    while (true) {delay(100);}
+    calibrating = false;
   }
-  float headingWhenFlat()
-  {
-    float heading = atan2((float)y, (float)x) * 180.0 / M_PI; //degrees without IMU input - assumes the drone is flat
-    return heading;  
-  }
+  
   float getHeadingRadians() {
     // 1. Refresh the raw values from the sensor
     while (!update()) delay(100);
