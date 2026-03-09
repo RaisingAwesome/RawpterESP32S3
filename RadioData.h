@@ -97,20 +97,26 @@ struct RadioData
     PWM_FailsafeSwitch = PWM_FailsafeSwitch_fs;
   }
 
-void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset) {
-    static float prev_errN = 0.0f;
-    static float prev_errE = 0.0f;
+  void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset) {
+    static float prev_errN = 0.0f, prev_errE = 0.0f;
+    static float integralN = 0.0f, integralE = 0.0f;
+    static float velN_filt = 0.0f, velE_filt = 0.0f;
     static unsigned long last_gps_time = 0;
-    static float K_accel2pwm = 5.0f;
-    static float K_d = 1.0f;
-    static float K_p = 5.0f;
-
-    // Use a local flag to handle the very first frame of GPS data
+    
+    // PID Gains - Tune these carefully!
+    const float K_p = 5.0f;
+    const float K_i = 0.01f;  // Small I-term for wind
+    const float K_d = 1.5f;   // D-term for damping
+    const float K_accel2pwm = 5.0f;
+    const float Alpha = 0.3f; // Low Pass Filter constant (0.0 to 1.0)
+    
     static bool first_run = true;
     
     if (reset) {
         last_gps_time = millis();
-        first_run = true; // Signal that we need to prime the error values
+        integralN = 0; integralE = 0;
+        velN_filt = 0; velE_filt = 0;
+        first_run = true;
         return; 
     }
 
@@ -118,10 +124,8 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
         float errN, errE;
         gpsErrorToNE(gps.latitude, gps.longitude, gps.homePosLatitude, gps.homePosLongitude, errN, errE);
 
-        // PRIMING: On the first loop after a reset, just store the values and exit
         if (first_run) {
-            prev_errN = errN;
-            prev_errE = errE;
+            prev_errN = errN; prev_errE = errE;
             last_gps_time = millis();
             first_run = false;
             return; 
@@ -129,50 +133,65 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
 
         unsigned long now = millis();
         float dt = (now - last_gps_time) / 1000.0f;
-        float dist2 = errN * errN + errE * errE;
+        float distSq = errN * errN + errE * errE;
 
-        // Standard PD Logic
-        if (dist2 > 3.0f && dt > 0.0f) {
-            float velN = (errN - prev_errN) / dt;
-            float velE = (errE - prev_errE) / dt;
+        // Ensure we have a valid time step and aren't already "home"
+        if (distSq > 1.0f && dt > 0.001f) {
+            // 1. Calculate Raw Velocity
+            float rawVelN = (errN - prev_errN) / dt;
+            float rawVelE = (errE - prev_errE) / dt;
 
-            float targetAccelN = (K_p * errN) + (K_d * velN);
-            float targetAccelE = (K_p * errE) + (K_d * velE);
+            // 2. Low Pass Filter the velocity (Reduces GPS jitter)
+            velN_filt = (Alpha * velN_filt) + ((1.0f - Alpha) * rawVelN);
+            velE_filt = (Alpha * velE_filt) + ((1.0f - Alpha) * rawVelE);
 
-            // 3. Coordinate Rotation
-            float psi = -imu.yaw_IMU * DEG_TO_RAD; // Negative because we want to rotate the error vector in the opposite direction of the drone's heading to get it into the drone's frame of reference.
+            // 3. Accumulate Integral (Wind compensation)
+            integralN += errN * dt;
+            integralE += errE * dt;
+            // Anti-windup: limit the integral impact
+            integralN = constrain(integralN, -10.0f, 10.0f);
+            integralE = constrain(integralE, -10.0f, 10.0f);
+
+            // 4. PID Output in Global (NED) Frame
+            float targetAccelN = (K_p * errN) + (K_i * integralN) + (K_d * velN_filt);
+            float targetAccelE = (K_p * errE) + (K_i * integralE) + (K_d * velE_filt);
+
+            // 5. Rotate to Drone Frame (Standard Rotation Matrix)
+            // [Forward]   [ cos(psi)  sin(psi)] [North]
+            // [ Right ] = [-sin(psi)  cos(psi)] [ East ]
+            float psi = imu.yaw_IMU * DEG_TO_RAD; 
             float c = cosf(psi);
             float s = sinf(psi);
 
             float accelForward =  c * targetAccelN + s * targetAccelE;
             float accelRight   = -s * targetAccelN + c * targetAccelE;
 
-            // 4. Update PWM outputs
+            // 6. PWM Mapping
             PWM_pitch = 1500.0f - (accelForward * K_accel2pwm);
+            PWM_roll  = 1500.0f + (accelRight   * K_accel2pwm);
+            
+            // Safety Limits (150us deviation max)
             PWM_pitch = constrain(PWM_pitch, 1350, 1650);
-            PWM_roll = 1500.0f + (accelRight   * K_accel2pwm);
             PWM_roll  = constrain(PWM_roll, 1350, 1650);
             
             gps.atHome = false;
-        } else if (dist2 <= 3.0f) {
-            // Arrived: Level the drone
+        } else {
+            // Arrived or stationary: Level out
             PWM_pitch = 1500;
             PWM_roll  = 1500;
-            gps.atHome = true;
+            if (distSq <= 1.0f) gps.atHome = true;
         }
 
-        // Store current values for the next loop's D-term calculation
         prev_errN = errN;
         prev_errE = errE;
         last_gps_time = now;
 
     } else {
-        // GPS lost failsafe: Level out immediately
         PWM_pitch = 1500;
         PWM_roll  = 1500;
-        gps.atHome = true; // Consider ourselves "home" if we have no GPS, so that we don't try to head to a non-existent home location.
+        gps.atHome = true; 
     }
-}
+  }
 
   void gpsErrorToNE(double lat_now, double lon_now,
                           double lat_home, double lon_home,
