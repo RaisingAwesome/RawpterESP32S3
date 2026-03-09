@@ -225,7 +225,7 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
           {
             throttle_is_cut = true; // if we are in this mode 5 seconds, then kill motors to prevent uncontrolled flyaway.
             landing = false;
-            PWM_throttle = 1500; 
+            PWM_throttle = 1500;
             return;
           }
           else
@@ -255,11 +255,11 @@ void headHome(GPSData& gps, RawpterIMU& imu, ConfigData& configData, bool reset)
                   // Integrator
                   integralAltitudeRate += rateError * 0.01f; // 100 Hz is ticks at .01 seconds
                   
-                  if (rateError > 0.5f && integralAltitudeRate < 0.0f)
+                  if (rateError > 1.8f && integralAltitudeRate < 0.0f)
                   {   // if going down too fast and the integrator has been decreasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }
-                  else if (rateError < -1.0f && integralAltitudeRate > 0.0f)
+                  else if (rateError < -1.8f && integralAltitudeRate > 0.0f)
                   {   // if going up too fast and the integrator has been increasing PWM, reset it to zero.
                       integralAltitudeRate = 0.0f;
                   }

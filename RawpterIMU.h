@@ -10,7 +10,7 @@ struct RawpterIMU
   RawpterIMU() : IMUSPI(HSPI) {}   // construct here
   long counter = 0;
   
-  float recipNorm;
+
   float s0, s1, s2, s3;
   float qDot1, qDot2, qDot3, qDot4;
   float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
@@ -121,9 +121,8 @@ struct RawpterIMU
       
       yaw_IMU = navHeading;
  }
- void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
+  void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
   {
-    
     // Precomputed constants
     constexpr float DEG2RAD = 0.01745329252f; // π/180
     constexpr float RAD2DEG = 57.29577951f;   // 180/π
@@ -183,7 +182,7 @@ struct RawpterIMU
 
     // Normalize quaternion
     float norm = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
-    recipNorm = 1.0f / sqrtf(norm);
+    float recipNorm = 1.0f / sqrtf(norm);
     q0 *= recipNorm;
     q1 *= recipNorm;
     q2 *= recipNorm;
@@ -197,9 +196,9 @@ struct RawpterIMU
     float twoq0q3 = 2.0f * (q0 * q3);
     float twoq1q2 = 2.0f * (q1 * q2);
 
-    roll_IMU  = atan2(2.0f * (q0*q1 + q2*q3), 1.0f - 2.0f * (q1*q1 + q2*q2)) * 57.29578f;
-    pitch_IMU = asin(2.0f * (q0*q2 - q3*q1)) * 57.29578f;
-    //yaw comes from a mag calc.
+    roll_IMU = atan2f(twoq0q1 + twoq2q3, 1.0f - 2.0f * (q1q1 + q2q2)) * RAD2DEG;
+    pitch_IMU = -asinf(twoq0q2 - twoq1q3) * RAD2DEG; // flip pitch axis to match NASA (NED)
+    //yaw is set by the Mag. yaw_IMU = -atan2f(twoq0q3 + twoq1q2, 1.0f - 2.0f * (q2q2 + q3q3)) * RAD2DEG; // flip yaw axis to match NASA
   }
 /*
   void Madgwick9DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float invSampleFreq) {

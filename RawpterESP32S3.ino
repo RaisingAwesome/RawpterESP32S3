@@ -371,7 +371,7 @@ void setupBatteryMonitor()
 void playStartSong()
 {
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {NOTE_E, NOTE_Fs, NOTE_A, NOTE_B, NOTE_A, NOTE_E, NOTE_Fs, NOTE_E, NOTE_FS, NOTE_E, NOTE_Fs, NOTE_E, NOTE_Fs};
+  note_t melody[] = {NOTE_E, NOTE_Fs, NOTE_A, NOTE_B, NOTE_A, NOTE_E, NOTE_Fs, NOTE_E, NOTE_Fs, NOTE_E, NOTE_Fs, NOTE_E, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {200, 200, 200, 580, 690, 200, 400, 200, 400, 200, 400, 200, 1200};
@@ -379,7 +379,7 @@ void playStartSong()
   for (int i = 0; i < 13; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i], 4);
+    ledcWriteNote(BUZZER_PIN, melody[i], 4);
 
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
@@ -391,7 +391,7 @@ void playStartSong()
 void playReadySong()
 {
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {NOTE_Fs, NOTE_Fs, NOTE_Fs};
+  note_t melody[] = {NOTE_Fs, NOTE_Fs, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {200, 200, 200};
@@ -399,7 +399,7 @@ void playReadySong()
   for (int i = 0; i < 3; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i] * 3, 4);
+    ledcWriteNote(BUZZER_PIN, melody[i], 6);
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
     delay(400);
@@ -410,7 +410,7 @@ void playNope()
   return;
   playingSong = true;
   // Melody (first bar of Danger Zone, simplified)
-  int melody[] = {NOTE_Fs, NOTE_Fs};
+  note_t melody[] = {NOTE_Fs, NOTE_Fs};
 
   // Durations (ms) — quarter = 400ms, half = 800ms
   int noteDurations[] = {50, 50};
@@ -418,7 +418,7 @@ void playNope()
   for (int i = 0; i < 2; i++)
   {
     int duration = noteDurations[i];
-    ledcWriteTone(BUZZER_PIN, melody[i] / 3, 4);
+    ledcWriteNote(BUZZER_PIN, melody[i], 2);
     delay(duration * .8); // add pause between notes
     ledcWriteTone(BUZZER_PIN, 0);
     delay(duration * .8);
@@ -446,7 +446,7 @@ inline void loopBuzzer()
   {
     if (myTime - buzzer_millis > (buzzer_spacing))
     {
-      ledcWriteTone(BUZZER_PIN, NOTE_E, 4);
+      ledcWriteNote(BUZZER_PIN, NOTE_E, 4);
       beeping = true;
       buzzer_millis = myTime;
     }
@@ -484,7 +484,7 @@ inline void getDesiredAnglesAndThrottleScaledToOne()
   pid.throttle_desired = (radioData.PWM_throttle - 1500.0f) / 500.0f;   // Between  0 and 1 because anything under 1500 will be set to 1500 for now.
   pid.roll_des = (radioData.PWM_roll - 1500.0f + configData.trimRoll) / 500.0f;    // Between -1 and 1
   pid.pitch_des = (radioData.PWM_pitch - 1500.0f + configData.trimPitch) / 500.0f; // Between -1 and 1
-  pid.yaw_des = (radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
+  pid.yaw_des = -(radioData.PWM_yaw - 1500.0f + configData.trimYaw) / 500.0f;       // Between -1 and 1
 
   // Constrain within normalized bounds
   pid.throttle_desired = constrain(pid.throttle_desired, 0.0f, 1.0f); // Between 0 and 1
@@ -514,7 +514,7 @@ void PIDControlCalcs()
   float q = imu.GyroY; // pitch rate (nose up positive) - pitch is already minused to correct physical orientation to NASA rules
   float r = imu.GyroZ; 
   
-  if (radioData.PWM_throttle < 1520) // Reset the control if on the ground. This prevents integral windup and sudden jumps on takeoff.
+  if (radioData.PWM_throttle < 1505) // Reset the control if on the ground. This prevents integral windup and sudden jumps on takeoff.
   {
     integral_rate_roll = integral_rate_pitch = integral_rate_yaw = 0;
     pid.roll_PID = pid.pitch_PID = pid.yaw_PID = 0;
@@ -570,6 +570,7 @@ void AngleLoopCalcs()
 
   if (++pid.PIDCounter < (INNER_LOOP_FREQUENCY / PID_FREQ_HZ))
     return;
+
   pid.PIDCounter = 0;
 
   dt = micros() - lastTimeMicros;
@@ -580,8 +581,7 @@ void AngleLoopCalcs()
   integral_roll += angleErrorRoll * dt;
   integral_roll = constrain(integral_roll, -configData.i_limit_angle, configData.i_limit_angle);
 
-  pid.desiredRateRoll = configData.Kp_roll_angle * angleErrorRoll +
-                    configData.Ki_roll_angle * integral_roll;
+  pid.desiredRateRoll = configData.Kp_roll_angle * angleErrorRoll + configData.Ki_roll_angle * integral_roll;
   pid.desiredRateRoll = constrain(pid.desiredRateRoll, -rollLimits.maxRate, rollLimits.maxRate);
 
   // --- Pitch ---
@@ -589,8 +589,7 @@ void AngleLoopCalcs()
   integral_pitch += angleErrorPitch * dt;
   integral_pitch = constrain(integral_pitch, -configData.i_limit_angle, configData.i_limit_angle);
 
-  pid.desiredRatePitch = configData.Kp_pitch_angle * angleErrorPitch +
-                     configData.Ki_pitch_angle * integral_pitch;
+  pid.desiredRatePitch = configData.Kp_pitch_angle * angleErrorPitch + configData.Ki_pitch_angle * integral_pitch;
   pid.desiredRatePitch = constrain(pid.desiredRatePitch, -pitchLimits.maxRate, pitchLimits.maxRate);
 
   // --- Yaw setpoint comes directly from the stick --- //
@@ -748,7 +747,7 @@ void throttleCut()
   {
     if (!telemetry.flying && altitudeData.altitude < 2 && !BENCH_TESTING) // this is tip over protection at take-off
     {
-      if (imu.roll_IMU > 15 || imu.roll_IMU < -15 || imu.pitch_IMU > 15 || imu.pitch_IMU < -15)
+      if (imu.roll_IMU > 30 || imu.roll_IMU < -30 || imu.pitch_IMU > 30 || imu.pitch_IMU < -30)
       {
         // This helps with struggles on take off or it sitting too tilted on the launch pad.
         motors.kill();
@@ -1429,7 +1428,7 @@ void GenerateDefaultPage(WiFiClient &client)
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";  
 
   body += "<br><br><br><input "
-        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#fff; "
+        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#00AA00; "
         "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
         "type='submit' name='action' value='SAVE TO STORAGE' "
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";
