@@ -1,4 +1,6 @@
 # INTRODUCTION
+[Check out the Instructable that covers the full build](https://www.instructables.com/The-Rawpter-9-Open-Source-Drone/)!
+
 Rawpter is a custom flight controller for a quadcopter. It is based on the ESP32-S3. It makes use of the ESP32's ability to run tasks on independent cores and multithreaded. In turn, it achieves a fast 1K inner loop on 32kHz downsampled gyro data.
 
 # Hardware
