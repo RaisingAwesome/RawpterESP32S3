@@ -96,31 +96,35 @@ struct RawpterIMU
     }
   }
   
-  void calculateNavHeading(float pitchDegrees, float rollDegrees, float magX, float magY, float magZ) 
-  {    
-      // 1. Convert input degrees to radians for trigonometric functions
-      float pitch = pitchDegrees * DEG_TO_RAD;
-      float roll = rollDegrees * DEG_TO_RAD;
+void calculateNavHeading(float pitchDegrees, float rollDegrees, float magX, float magY, float magZ) 
+{    
+    float pitch = pitchDegrees * DEG_TO_RAD;
+    float roll = rollDegrees * DEG_TO_RAD;
 
-      // 2. Tilt compensate the magnetometer readings
-      float cosP = cos(pitch);
-      float sinP = sin(pitch);
-      float cosR = cos(roll);
-      float sinR = sin(roll);
+    float cp = cos(pitch);
+    float sp = sin(pitch);
+    float cr = cos(roll);
+    float sr = sin(roll);
 
-      // Projects the 3D mag vector onto a virtual horizontal plane
-      float Xh = magX * cosP + magY * sinR * sinP + magZ * cosR * sinP;
-      float Yh = magY * cosR - magZ * sinR;
+    // 1. PITCH: Use the 'Minus' version which stayed positive in your test
+    float Xh = magX * cp - magZ * sp; 
 
-      // 3. Calculate the heading relative to magnetic North
-      float heading = atan2(-Yh, Xh);
+    // 2. ROLL: We need to find the sign for Yh.
+    // Let's test Yh_Plus and Yh_Minus just like we did for X.
+    float Yh_plus  = magY * cr + magZ * sr;
+    float Yh_minus = magY * cr - magZ * sr;
 
-      // 4. Convert result back to degrees and normalize to 0-360
-      float navHeading = heading * RAD_TO_DEG;
-      if (navHeading < 0) navHeading += 360.0;
-      
-      yaw_IMU = navHeading;
- }
+    // FOR NOW: Use Minus, but watch if it jumps on a roll.
+    // If it jumps, swap it to Plus.
+    float Yh = Yh_plus; 
+
+    float heading = atan2(Yh, Xh); 
+
+    float navHeading = heading * RAD_TO_DEG;
+    if (navHeading < 0) navHeading += 360.0;
+    
+    yaw_IMU = navHeading;
+}
   void Madgwick6DOF(float B_madgwick, float gx, float gy, float gz, float ax, float ay, float az, float dt)
   {
     // Precomputed constants

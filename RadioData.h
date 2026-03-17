@@ -106,7 +106,7 @@ struct RadioData
     // PID Gains - Tune these carefully!
     const float K_p = 5.0f;
     const float K_i = 0.01f;  // Small I-term for wind
-    const float K_d = 1.5f;   // D-term for damping
+    const float K_d = 0.0f;   // D-term for damping
     const float K_accel2pwm = 5.0f;
     const float Alpha = 0.3f; // Low Pass Filter constant (0.0 to 1.0)
     
@@ -133,6 +133,11 @@ struct RadioData
 
         unsigned long now = millis();
         float dt = (now - last_gps_time) / 1000.0f;
+        if (dt<1) {
+          PWM_pitch = PWM_pitch_prev;
+          PWM_roll = PWM_roll_prev;
+          return;
+        }
         float distSq = errN * errN + errE * errE;
 
         // Ensure we have a valid time step and aren't already "home"
@@ -156,9 +161,6 @@ struct RadioData
             float targetAccelN = (K_p * errN) + (K_i * integralN) + (K_d * velN_filt);
             float targetAccelE = (K_p * errE) + (K_i * integralE) + (K_d * velE_filt);
 
-            // 5. Rotate to Drone Frame (Standard Rotation Matrix)
-            // [Forward]   [ cos(psi)  sin(psi)] [North]
-            // [ Right ] = [-sin(psi)  cos(psi)] [ East ]
             float psi = imu.yaw_IMU * DEG_TO_RAD; 
             float c = cosf(psi);
             float s = sinf(psi);
@@ -171,8 +173,8 @@ struct RadioData
             PWM_roll  = 1500.0f + (accelRight   * K_accel2pwm);
             
             // Safety Limits (150us deviation max)
-            PWM_pitch = constrain(PWM_pitch, 1350, 1650);
-            PWM_roll  = constrain(PWM_roll, 1350, 1650);
+            PWM_pitch = constrain(PWM_pitch, 1400, 1600);
+            PWM_roll  = constrain(PWM_roll, 1400, 1600);
             
             gps.atHome = false;
         } else {
@@ -249,7 +251,13 @@ struct RadioData
           }
           else
           {
-              headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
+              if (altitudeData.altitude > 8.0f&&altitudeData.altitude < 11.0f)
+                headHome(gps,imu,configData, resetGPS); // this will override pitch and roll PWM to head home if a GPS exists.
+              else
+              { // Level out when we are adjusting our altitude
+                PWM_pitch = 1500;
+                PWM_roll = 1500; 
+              }
               resetGPS = false;
               if (++throttleOverrideCounter >= INNER_LOOP_FREQUENCY/ALT_FREQ_HZ) // Only make a move if we are at the altitude control frequency
               {
@@ -257,15 +265,15 @@ struct RadioData
                   float landingRate = altitudeData.targetRateLanding; // Default to heading downward.
                   if (gps.useGPS && !gps.atHome) // Once this is working, change this such that it will go do to a low altitude like 12ft while it heads back.
                   {
-                      if (altitudeData.altitude < 8.0f) // Until we are at home, stay between 8.0 - 11.0 ft
+                      if (altitudeData.altitude < 8.0f) 
                       {
-                        landingRate = 0.1f;
+                        landingRate = 0.02f; // Until we are at home, stay between 8.0 - 11.0 ft
                       }
                       else
                       {
-                        if (altitudeData.altitude < 11.0f) // Hold altitude if between 8.0 - 11.0 ft
+                        if (altitudeData.altitude < 11.0f) 
                         {
-                          landingRate = 0.0f;
+                          landingRate = 0.0f; // Hold altitude if between 8.0 - 11.0 ft
                         }
                       }
                   }

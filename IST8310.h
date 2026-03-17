@@ -9,7 +9,7 @@ const uint8_t  IST8310_WHO_AM_I_VAL = 0x10;
 
 struct IST8310
 { 
-  int16_t x=0, y=0, z=0;
+  float x=0.0f, y=0.0f, z=0.0f;
   bool hasData = false;
   bool calibrating = false;
   // Calibration parameters
@@ -48,7 +48,7 @@ struct IST8310
     if (calibrating&&withOffsets) return false; // Do nothing if calibrating but its being called from the main.
     // Only read if DRDY is HIGH
     if (REG_READ(GPIO_IN_REG) & (1 << MAG_DRDY_PIN)) { //fast way to check if IO5 is high
-      if (readIST8310(x, y, z, withOffsets)) return true; else return false;
+      if (readIST8310(withOffsets)) return true; else return false;
     } 
     else
     {
@@ -56,11 +56,11 @@ struct IST8310
     } 
   }
 
-  bool readIST8310(int16_t &x, int16_t &y, int16_t &z, bool withOffsets = true) {    
+  bool readIST8310(bool withOffsets = true) {    
     Wire.beginTransmission(IST8310_ADDR);
     Wire.write(REG_DATA_X_L);
     if (Wire.endTransmission() != 0) return false;
-
+    int16_t mx = 0, my=0, mz=0;
     Wire.requestFrom(IST8310_ADDR, (uint8_t)6);
     if (Wire.available() == 6) {
       uint8_t xl = Wire.read();
@@ -70,15 +70,21 @@ struct IST8310
       uint8_t zl = Wire.read();
       uint8_t zh = Wire.read();
 
-      x = -(int16_t)(xh << 8 | xl); // must be flipped with the minus sign to match the installed orientation
-      y = (int16_t)(yh << 8 | yl);
-      z = -(int16_t)(zh << 8 | zl); // must be flipped with the minus sign to match the installed orientation
+      mx = -(int16_t)(xh << 8 | xl); // must be flipped with the minus sign to match the installed orientation
+      my = (int16_t)(yh << 8 | yl);
+      mz = -(int16_t)(zh << 8 | zl); // must be flipped with the minus sign to match the installed orientation
 
       if (withOffsets)
       {
-        x = ((float)x - offX) * scaleX; // (x- offset) * scalex from running CALIBRATE_MAGNETOMETER = true
-        y = ((float)y - offY) * scaleY;
-        z = ((float)z - offZ) * scaleZ;
+        x = ((float)mx - offX) * scaleX; // (x- offset) * scalex from running CALIBRATE_MAGNETOMETER = true
+        y = ((float)my - offY) * scaleY;
+        z = ((float)mz - offZ) * scaleZ;
+      }
+      else
+      {
+        x=(float)mx;
+        y=(float)my;
+        z=(float)mz;
       }
       return true;
     }
@@ -87,9 +93,9 @@ struct IST8310
 
   void calibrate(uint32_t duration_ms = 55000) {
     // Calibration is triggered with the WebUI
-    int16_t minX = 32767, maxX = -32768;
-    int16_t minY = 32767, maxY = -32768;
-    int16_t minZ = 32767, maxZ = -32768;
+    float minX = 32767.0f, maxX = -32768.0f;
+    float minY = 32767.0f, maxY = -32768.0f;
+    float minZ = 32767.0f, maxZ = -32768.0f;
     calibrating = true;
     uint32_t startTime = millis();
 

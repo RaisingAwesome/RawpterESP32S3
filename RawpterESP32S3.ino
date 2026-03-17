@@ -1,12 +1,12 @@
 // Rawpter 9.0 by Sean J. Miller
 // Flight Controller code for ESP32-S3
-// Go to https:// raisingawesome.site/projects for more info
+// Go to https://raisingawesome.site/projects for more info
 // MIT License - use at your own risk
 
 #include "Project.h"
 
 constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
-constexpr bool CALIBRATE_ESCS = false; // used for bench calibration - be careful!!!!
+constexpr bool CALIBRATE_ESCS = false; // used for bench calibration with Props Off - be careful!!!!
 constexpr bool CALCULATE_IMU_ERROR = false; // used to generate the error parameters
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
@@ -433,8 +433,6 @@ inline void loopBuzzer()
   static unsigned long buzzer_spacing = 30000;
   static unsigned long buzzer_millis = millis();
   unsigned long myTime = millis();
-  
-  return;
 
   if (playingSong||BENCH_TESTING) return;
   if (radioData.PWM_FailsafeSwitch < 1500)
@@ -1032,7 +1030,7 @@ void showMagCalibrationMessage(WiFiClient &client)
           move it like you are painting the interior of a sphere to cover every 
           angle and direction.
       </div>
-      <div class="timer" id="countdown">30</div>
+      <div class="timer" id="countdown">60</div>
 
       <script>
           var seconds = 60;
