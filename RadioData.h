@@ -161,16 +161,18 @@ struct RadioData
             float targetAccelN = (K_p * errN) + (K_i * integralN) + (K_d * velN_filt);
             float targetAccelE = (K_p * errE) + (K_i * integralE) + (K_d * velE_filt);
 
-            float psi = imu.yaw_IMU * DEG_TO_RAD; 
-            float c = cosf(psi);
-            float s = sinf(psi);
+            float psi = imu.yaw_IMU; 
+            if (psi > 180.0f) psi -= 360.0f; // Wrap to -180 to 180
+            float psi_rad = psi * DEG_TO_RAD;
+            float c = cosf(psi_rad);
+            float s = sinf(psi_rad);
 
             float accelForward =  c * targetAccelN + s * targetAccelE;
             float accelRight   = -s * targetAccelN + c * targetAccelE;
 
             // 6. PWM Mapping
-            PWM_pitch = 1500.0f - (accelForward * K_accel2pwm);
-            PWM_roll  = 1500.0f + (accelRight   * K_accel2pwm);
+            PWM_pitch = 1500.0f + (accelForward * K_accel2pwm); //if it is going the wrong way, subtract instead of add.
+            PWM_roll  = 1500.0f + (accelRight   * K_accel2pwm); //if it is going the wrong way, subtract instead of add.
             
             // Safety Limits (150us deviation max)
             PWM_pitch = constrain(PWM_pitch, 1400, 1600);

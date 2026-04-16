@@ -7,7 +7,6 @@
 
 constexpr bool BENCH_TESTING = false; // Used for bench testing safely with USB power only
 constexpr bool CALIBRATE_ESCS = false; // used for bench calibration with Props Off - be careful!!!!
-constexpr bool CALCULATE_IMU_ERROR = false; // used to generate the error parameters
 
 Preferences prefs; // Stores key flight controller configuration to ESP32S3 onboard storage
 AltitudeData altitudeData{};
@@ -53,7 +52,6 @@ void setup()
   altitudeData.begin(configData.failsafeThrottlePWM);     // Gets some default info and ensures their is a working BMP581 on board
   magnetometer.begin();      // Initialize the IST8310.
   imu.begin(magnetometer);   // Ensures there is a working IMU on board - it's imperative.
-  if (CALCULATE_IMU_ERROR) imu.calculateIMUError(); // Use periodically to obtain the IMU error factors for calibration.
   if (altitudeData.hasBMP581) beginSensorsTask(); // The sensor reads are blocking and slows the inner loop.  So, this runs it in a separate task.
 
   if (!BENCH_TESTING)
@@ -965,12 +963,20 @@ void loopWiFi()
   // --- Your form submission ---
   else if (req.startsWith("GET /?"))
   {
-    bool calibrateMagnetometer = setValuesFromUserForm(req);
+    int calibrationCheck = setValuesFromUserForm(req);
     
-    if (calibrateMagnetometer)
+    if (calibrationCheck==1)
     {
       showMagCalibrationMessage(client);
       magnetometer.calibrate();
+      saveParameters();
+      client.stop();
+    }
+    else if (calibrationCheck==2)
+    {
+      showIMUCalibrationMessage(client);
+      //blah
+      imu.calculateIMUError();
       saveParameters();
       client.stop();
     }
@@ -1059,14 +1065,61 @@ void showMagCalibrationMessage(WiFiClient &client)
   client.print(body);
 }
 
-bool setValuesFromUserForm(String req)
+void showIMUCalibrationMessage(WiFiClient &client)
+{
+  // We use a raw string literal (R"raw(...)raw") to make the HTML/JS much easier to read
+  const char *body = R"raw(
+  <!DOCTYPE html>
+  <html>
+  <head>
+      <title>Calibrating the IMU</title>
+      <style>
+          body { font-family: sans-serif; text-align: center; padding: 50px; }
+          .message { font-size: 40pt; margin-bottom: 20px; }
+          .timer { font-size: 80pt; color: #ff4444; font-weight: bold; }
+      </style>
+  </head>
+  <body>
+      <div class="message">
+          Calibrating the IMU... Keep it flat and still.
+      </div>
+      <div class="timer" id="countdown">60</div>
+
+      <script>
+          var seconds = 60;
+          var display = document.getElementById('countdown');
+          
+          var timer = setInterval(function() {
+              seconds--;
+              display.innerText = seconds;
+              if (seconds <= 0) {
+                  clearInterval(timer);
+                  window.location.href = "/";
+              }
+          }, 1000);
+      </script>
+  </body>
+  </html>)raw";
+
+  int len = strlen(body);
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.print("Content-Length: ");
+  client.println(len);
+  client.println();
+  client.print(body);
+}
+
+int setValuesFromUserForm(String req)
 { // return true if they want the magnetometer calibrated.
   // Read the full request line (already done in loopWiFi)
 
   int qIndex = req.indexOf('?');
   int hIndex = req.indexOf("HTTP");
   if (qIndex == -1 || hIndex == -1)
-    return false;
+    return 0;
   
   Serial.println(req);
   String query = req.substring(qIndex + 1, hIndex - 1); // everything between ? and " HTTP"
@@ -1190,11 +1243,14 @@ bool setValuesFromUserForm(String req)
           saveParameters();
       } 
       else if (value.indexOf("BEGIN MAG") != -1) {
-          return true; // this will trigger the magnetometer calibration routine.
+          return 1; // this will trigger the magnetometer calibration routine.
+      }
+      else if (value.indexOf("BEGIN IMU") != -1) {
+          return 2; // this will trigger the magnetometer calibration routine.
       }
     }
   }
-  return false;
+  return 0;
 }
 
 void saveParameters()
@@ -1249,6 +1305,12 @@ void saveParameters()
   prefs.putFloat("scaleX", magnetometer.scaleX);
   prefs.putFloat("scaleY", magnetometer.scaleY);
   prefs.putFloat("scaleZ", magnetometer.scaleZ);
+  prefs.putFloat("AccErrorX", imu.AccErrorX);
+  prefs.putFloat("AccErrorY", imu.AccErrorY);
+  prefs.putFloat("AccErrorZ", imu.AccErrorZ);
+  prefs.putFloat("GyroErrorX", imu.GyroErrorX);
+  prefs.putFloat("GyroErrorY", imu.GyroErrorY);
+  prefs.putFloat("GyroErrorZ", imu.GyroErrorZ);
   prefs.end(); // close namespace
 }
 
@@ -1307,6 +1369,12 @@ void loadParameters()
   magnetometer.scaleX = prefs.getFloat("scaleX", magnetometer.scaleX);
   magnetometer.scaleY = prefs.getFloat("scaleY", magnetometer.scaleY);  
   magnetometer.scaleZ = prefs.getFloat("scaleZ", magnetometer.scaleZ);
+  imu.AccErrorX = prefs.getFloat("AccErrorX", imu.AccErrorX);
+  imu.AccErrorY = prefs.getFloat("AccErrorY", imu.AccErrorY);
+  imu.AccErrorZ = prefs.getFloat("AccErrorZ", imu.AccErrorZ);
+  imu.GyroErrorX = prefs.getFloat("GyroErrorX", imu.GyroErrorX);
+  imu.GyroErrorY = prefs.getFloat("GyroErrorY", imu.GyroErrorY);
+  imu.GyroErrorZ = prefs.getFloat("GyroErrorZ", imu.GyroErrorZ);
   prefs.end();
 }
 
@@ -1410,7 +1478,7 @@ void GenerateDefaultPage(WiFiClient &client)
   body += "<tr><td>Trim - Pitch (-500 to 500):</td><td><input type=number name=trimPitch style='width:80px;' value='" + String(configData.trimPitch) + "'></td></tr>";
   body += "<tr><td>Trim - Roll (-500 to 500):</td><td><input type=number name=trimRoll style='width:80px;' value='" + String(configData.trimRoll) + "'></td></tr>";
   body += "<tr><td>Trim - Yaw (-500 to 500):</td><td><input type=number name=trimYaw style='width:80px;' value='" + String(configData.trimYaw) + "'></td></tr>";
-  body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(configData.throttleLimit, 2) + "'></td></tr>";
+  body += "<tr><td>Throttle Limit (0.01-1.0):<br>0.1=slow, 1.0=full speed</td><td><input type=number step=0.01 name=throttleLimit style='width:80px;' value='" +  String(configData.throttleLimit, 2) + "'></td></tr>";
   body += "<tr><td>Up Dampening (0.001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.001 name=UP_COEFF style='width:80px;' value='" +  String(configData.UP_COEFF, 3) + "'></td></tr>";
   body += "<tr><td>Down Dampening (0.00001-1.0):<br>0.1=slow, 1.0=fast</td><td><input type=number step=0.00001 name=DOWN_COEFF style='width:80px;' value='" +  String(configData.DOWN_COEFF, 5) + "'></td></tr>";
   body += "<tr><td>Failsafe Down Dampening (0.00001-0.03):<br>slow to fast<br>default 0.0006</td><td><input type=number step=0.00001 name=failsafeCoeff style='width:100px;' value='" +  String(configData.failsafeCoeff, 6) + "'></td></tr>";
@@ -1426,7 +1494,7 @@ void GenerateDefaultPage(WiFiClient &client)
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";  
 
   body += "<br><br><br><input "
-        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#00AA00; "
+        "style='margin-top:8px; padding:6px 12px; background-color:#00AA00; color:#fff; "
         "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
         "type='submit' name='action' value='SAVE TO STORAGE' "
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').style.display='inline'; return true;\" />";
@@ -1435,6 +1503,12 @@ void GenerateDefaultPage(WiFiClient &client)
         "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
         "type='submit' name='action' value='BEGIN MAG CALIBRATION' "
         "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').innerHtml='Get Ready to Rotate the Drone...'; document.getElementById('shower').style.display='inline'; return true;\" />";
+  
+body += "<br><br><br><input "
+        "style='margin-top:8px; padding:6px 12px; background-color:#ff0000; color:#fff; "
+        "border:1px solid #0d6efd; border-radius:4px; width:100%; cursor:pointer; font-size:20px;' "
+        "type='submit' name='action' value='BEGIN IMU CALIBRATION' "
+        "onclick=\"document.getElementById('myHider').style.display='none'; document.getElementById('shower').innerHtml='Keep the Drone Perfectly Still and Flat...'; document.getElementById('shower').style.display='inline'; return true;\" />";
   
   body += "</div></div>"
     "<div style='display:none' id='shower'>"

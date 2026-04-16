@@ -121,7 +121,7 @@ void calculateNavHeading(float pitchDegrees, float rollDegrees, float magX, floa
     float heading = atan2(Yh, Xh); 
 
     float navHeading = heading * RAD_TO_DEG;
-    if (navHeading < 0) navHeading += 360.0;
+    if (navHeading > 180.0f) navHeading -= 360.0f; 
     
     yaw_IMU = navHeading;
 }
@@ -479,6 +479,8 @@ void calculateIMUError()
 
     AccErrorX = AccErrorY = AccErrorZ = 0;
     GyroErrorX = GyroErrorY = GyroErrorZ = 0;
+    
+    delay(10000); // this gives the person time to get it adjusted flat and still
 
     int c = 0;
     while (c < 30000)
@@ -542,28 +544,5 @@ void calculateIMUError()
     GyroErrorX /= c;
     GyroErrorY /= c;
     GyroErrorZ /= c;
-
-    Serial.print("float AccErrorX = ");
-    Serial.print(AccErrorX);
-    Serial.println(";");
-    Serial.print("float AccErrorY = ");
-    Serial.print(AccErrorY);
-    Serial.println(";");
-    Serial.print("float AccErrorZ = ");
-    Serial.print(AccErrorZ);
-    Serial.println(";");
-
-    Serial.print("float GyroErrorX = ");
-    Serial.print(GyroErrorX);
-    Serial.println(";");
-    Serial.print("float GyroErrorY = ");
-    Serial.print(GyroErrorY);
-    Serial.println(";");
-    Serial.print("float GyroErrorZ = ");
-    Serial.print(GyroErrorZ);
-    Serial.println(";");
-
-    Serial.println("Paste these values in user specified variables section and comment out calculateIMUError() in void setup.");
-    while (true) delay(10);
   }  
 };
